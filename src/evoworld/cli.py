@@ -13,6 +13,9 @@ def main():
     training.add_argument("--resume")
     training.add_argument("--init-checkpoint", help="Transfer v1/v2 weights into a fresh AL run")
     training.add_argument("--out")
+    training.add_argument("--batch-size", type=int, help="Clips per GPU/process")
+    training.add_argument("--grad-accumulation", type=int)
+    training.add_argument("--workers", type=int, help="DataLoader workers per GPU/process")
     training.add_argument("--max-steps", type=int, help="Stop after this total number of optimizer updates")
     inspect = commands.add_parser("inspect", help="Strictly load detector and report parameter counts")
     inspect.add_argument("--config", default="configs/full.yaml")
@@ -90,8 +93,16 @@ def main():
                 config.out = args.out
             if args.max_steps is not None and args.max_steps < 1:
                 parser.error("--max-steps must be positive")
+            for option in ("batch_size", "grad_accumulation", "workers"):
+                value = getattr(args, option)
+                if value is not None:
+                    setattr(config, option, value)
+            config.validate()
             checkpoint = train(config, args.resume, args.max_steps, args.init_checkpoint)
-        print(f"Checkpoint: {checkpoint}")
+        import os
+
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"Checkpoint: {checkpoint}")
     else:
         from evoworld.runtime import load_for_inference
 

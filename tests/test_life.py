@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn.functional as F
 from evoworld.models.system import EvoWorld
@@ -240,3 +241,27 @@ def test_dropout_and_corruption_preserve_ground_truth_and_anchor(config):
     torch.testing.assert_close(memory, anchor, rtol=0, atol=0)
     assert not torch.equal(corrupted, anchor)
     torch.testing.assert_close(corrupted.norm(dim=-1), torch.ones(1, 2))
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.float16, torch.bfloat16])
+def test_mixed_precision_forecast_assignment_and_actor_gradient(config, cache_dtype):
+    from evoworld.planning import ForecastCache
+
+    feature = F.normalize(torch.randn(3, 1, config.embedding_dim), dim=-1).to(cache_dtype)
+    cache = ForecastCache(
+        torch.tensor([0]),
+        torch.ones(3, 1, 4, dtype=cache_dtype),
+        feature,
+        torch.full((3, 1), 0.7, dtype=cache_dtype),
+        torch.ones(3, 1, 4),
+        1,
+    )
+    memory = F.normalize(torch.randn(2, config.embedding_dim), dim=-1)
+    measured = F.normalize(torch.randn_like(memory), dim=-1)
+    gate = torch.full((2,), 0.2, dtype=cache_dtype, requires_grad=True)
+    result = cache.affinities(memory, measured, gate, torch.tensor([0, 0]))
+    summary = cache.summary(memory.to(cache_dtype))
+    assert result.dtype == summary.dtype == torch.float32
+    assert torch.isfinite(result).all() and torch.isfinite(summary).all()
+    result[:, 0].sum().backward()
+    assert gate.grad is not None and torch.isfinite(gate.grad).all() and gate.grad.abs().sum() > 0

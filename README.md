@@ -118,7 +118,7 @@ Preprocess mặc định: resize trực tiếp, BGR→RGB, `/255`, ImageNet mean
 ## 4. Train full AL
 
 ```bash
-python -m evoworld train --config configs/full.yaml
+bash tools/train.sh --config configs/full.yaml
 ```
 
 Mặc định 960×544, clip 8, burn-in 2, open-loop horizon 4; RSSM hidden128/stochastic16, ReID128, 8 neighbors, 3 motion modes. CNN chạy một lần/frame; các lựa chọn AL dùng chung feature map và physical forecast.
@@ -134,8 +134,8 @@ Training giữ object slots để supervised recovery/lifecycle kể cả khi po
 Cấu hình giảm bộ nhớ, vẫn full AL: `configs/compact.yaml` (640×384, clip6, forecast3). Chưa đo peak VRAM/GPU throughput:
 
 ```bash
-python -m evoworld train --config configs/compact.yaml --out runs/check_al --max-steps 1
-python -m evoworld train --config configs/compact.yaml --out runs/check_al --resume runs/check_al/last.pt
+bash tools/train.sh --config configs/compact.yaml --out runs/check_al --max-steps 1
+bash tools/train.sh --config configs/compact.yaml --out runs/check_al --resume runs/check_al/last.pt
 ```
 
 CPU là mặc định trên Mac; CUDA tự chọn khi có. `--max-steps` là tổng optimizer updates, không phải số update thêm. Số update/epoch = `ceil(ceil(num_clips / batch_size) / grad_accumulation)`.
@@ -167,10 +167,10 @@ Selected agents dùng shared recurrent future predictions; neighbor interaction 
 
 ```bash
 # Tiếp tục đúng run v2: optimizer/scaler/RNG/sample offset được giữ.
-python -m evoworld train --config configs/full.yaml --resume runs/al_full/last.pt
+bash tools/train.sh --config configs/full.yaml --resume runs/al_full/last.pt
 
 # Dùng v1 weights để khởi tạo AL; optimizer mới, AL mới, thư mục run mới.
-python -m evoworld train --config configs/full.yaml --out runs/al_from_v1 \
+bash tools/train.sh --config configs/full.yaml --out runs/al_from_v1 \
   --init-checkpoint runs/full/best.pt
 ```
 
@@ -180,7 +180,76 @@ Checkpoint v2 lưu model, optimizer, scaler, counters policy/critic, RNG, progre
 
 Run mặc định `runs/al_full/` gồm `last.pt`, `best.pt` theo validation IDF1, `run.json`, `metrics.jsonl`, validation MOT results. Loss có thêm `al_lifecycle`, `al_memory`, `al_effect`, `al_actor` và số examples. Likelihood/variance losses có thể âm; không suy diễn chất lượng tracking chỉ từ loss. `al_actor` bằng 0 trước critic warmup là có chủ ý. AMP gradient overflow được skip/backoff scale và không tăng optimized policy counters.
 
-## 7. Tracking và evaluation
+## 7. Train 2 GPU bằng torchrun DDP
+
+Mỗi GPU chạy một tiến trình, nhận các clip khác nhau và đồng bộ gradient. Model/optimizer được nhân bản theo GPU; VRAM không được gộp thành một vùng chung. Đây là DistributedDataParallel, không phải chạy hai run độc lập. Xem [PyTorch DDP](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html).
+
+Lệnh ngắn trong Kaggle Notebook sau khi cập nhật source:
+
+```python
+%cd /kaggle/working/EvoWorld-MOT
+!bash tools/train_2gpu.sh --out /kaggle/working/runs/al_2gpu --init-checkpoint /kaggle/working/runs/al_full/last.pt
+```
+
+Bỏ `--init-checkpoint ...` nếu train mới hoàn toàn. Launcher kiểm tra có hai CUDA GPU, dùng batch1/GPU, accumulation2, workers1/GPU và chuyển tiếp các flags cho CLI. Có thể đổi cổng bằng `EVOWORLD_MASTER_PORT` nếu cần. Raw torchrun command tương đương ở dưới.
+
+Giữ config dataset/checkpoint đang chạy đúng trên Kaggle. Để giữ batch hiệu dụng 4 clip như run 1 GPU, dùng **batch 1/GPU × accumulation 2 × 2 GPU**. LR được giữ nguyên, không tự nhân đôi.
+
+```bash
+cd /kaggle/working/EvoWorld-MOT
+python -m torch.distributed.run --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29517 -m evoworld train --config configs/full.yaml --batch-size 1 --grad-accumulation 2 --workers 1 --out /kaggle/working/runs/al_2gpu
+```
+
+Nếu muốn dùng trọng số từ run 1 GPU đang có, thêm `--init-checkpoint /kaggle/working/runs/al_full/last.pt`. Đây là warm-start: giữ weights/counters đã học, bắt đầu optimizer/sampler mới. Source đã đổi và topology đổi, vì vậy không coi đây là resume chính xác của run cũ. Để resume run 2 GPU đã lưu bằng bản mới:
+
+```bash
+python -m torch.distributed.run --nnodes=1 --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29517 -m evoworld train --config configs/full.yaml --batch-size 1 --grad-accumulation 2 --workers 1 --out /kaggle/working/runs/al_2gpu --resume /kaggle/working/runs/al_2gpu/last.pt
+```
+
+Trong Notebook thêm `!` trước lệnh `python`. Config `device: auto` hoặc `cuda` sẽ ánh xạ theo LOCAL_RANK. Log đầu phải có `world_size: 2`, `devices: ["cuda:0", "cuda:1"]`, `effective_batch: 4`. Với 6,016 clip, mặc định trên cho 1,504 optimizer groups/epoch trước AMP skips.
+
+- `batch_size`, `workers` là **mỗi GPU/process**. `clips_seen` là global; loss log trung bình các rank. AL counters cộng toàn bộ ví dụ đã tối ưu từ cả hai rank.
+- Sampler không pad lặp clip; nếu số clip lẻ so với world size, bỏ nhiều nhất world_size−1 clip cuối permutation mỗi epoch và báo `dropped_clips`.
+- Probe frequency được tính theo global microbatch và luân phiên rank thực hiện, tránh tự nhân đôi chi phí replay khi thêm GPU.
+- Chỉ rank 0 ghi log/checkpoint và chạy validation. Checkpoint lưu RNG riêng từng rank; resume yêu cầu cùng world size và config tối ưu.
+- DataLoader dùng spawn trong DDP và giới hạn OpenCV threads trong worker. Gradient accumulation dùng `no_sync` cho các microbatch chưa tới boundary; nhánh replay có unused parameters được DDP xử lý. [PyTorch accumulation guidance](https://docs.pytorch.org/docs/stable/notes/amp_examples.html#gradient-accumulation).
+- AMP overflow trên bất kỳ rank nào sẽ skip update và backoff scale ở mọi rank; không tăng AL counters cho nhóm bị skip. Cache summary/affinities dùng FP32 để tránh lỗi Float/Half khi indexed assignment, trong khi CNN tiếp tục dùng AMP.
+
+Có thể kiểm tra 5 update trước bằng `--max-steps 5`, rồi dùng `--resume` như trên. Môi trường phát triển đã kiểm tra 2 tiến trình CPU/Gloo, gradient conditional-accumulation và resume; NCCL/2 CUDA GPU vẫn cần chạy trên máy Kaggle thực tế. Không hứa tốc độ tăng đúng 2×.
+
+```bash
+RUN_DISTRIBUTED_TESTS=1 python -m pytest tests/test_distributed.py -q
+```
+
+Kết quả kiểm tra và giới hạn phần cứng: [docs/DISTRIBUTED_VALIDATION.md](docs/DISTRIBUTED_VALIDATION.md).
+
+## Log training gọn cho Terminal và Kaggle
+
+Launcher 1 GPU và 2 GPU mặc định hiển thị bảng compact, không cần notebook widgets:
+
+```python
+# Kaggle: 1 GPU/process
+!bash tools/train.sh --config configs/full.yaml --out /kaggle/working/runs/al_full
+
+# Kaggle: 2 GPU; giữ các flags init/resume như phần DDP
+!bash tools/train_2gpu.sh --out /kaggle/working/runs/al_2gpu
+```
+
+Cột hiển thị: Epoch, global Update, Clips đã xử lý trong epoch, Loss, Det, ReID, Assoc, World, trạng thái AL, Grad, global clip/s và ETA phần train còn lại của epoch. Loss làm tròn để dễ đọc; World có thể âm; Grad là norm trước clipping. AL chuyển từ `warm` sang `ready` khi cả policy/critic đủ example counters, không phải chứng nhận chất lượng model.
+
+Mặc định in 3 update đầu, sau đó mỗi 10 update hoặc heartbeat khoảng 30 giây khi có metrics mới; luôn in update cuối. `--log-every 1` để hiện mọi update. Tốc độ là EMA từ các bản ghi liên tiếp, không chia offset đã resume cho thời gian mới; ETA reset ở đầu epoch và chưa tính thời gian validation.
+
+```bash
+bash tools/train_2gpu.sh --out runs/al_2gpu --log-every 20
+bash tools/train_2gpu.sh --out runs/al_2gpu --log-format json
+bash tools/train.sh --config configs/full.yaml --out runs/al_full --log-format quiet
+```
+
+`metrics.jsonl` vẫn được trainer ghi đủ mọi update, đầy đủ fields và precision. `json` giữ nguyên stdout; `quiet` ẩn bảng/metrics nhưng vẫn chuyển tiếp diagnostics. Traceback/stderr và exit code của train được giữ; interrupt sẽ dừng process group được launcher tạo, kể cả torchrun workers.
+
+Formatter nằm trong `tools/` và không sửa code objective, optimizer, sampler, config hay fingerprint trong `src/`. Vì vậy chỉ đổi giao diện console không làm checkpoint source-guard bị thay đổi. Các flags log chỉ được launcher xử lý, không đưa vào config/checkpoint. Lệnh raw `python -m evoworld train ...` vẫn xuất JSON cho automation.
+
+## 8. Tracking và evaluation
 
 ```bash
 python -m evoworld track --checkpoint runs/al_full/best.pt \
@@ -204,7 +273,7 @@ python -m evoworld evaluate --checkpoint runs/al_full/best.pt \
 
 Protocol hiện tại là COCO-MOT 10 class với explicit ignore regions, không tự nhận official VisDrone 4/5-class preprocessing. Paper phải cố định dataset protocol và dùng official evaluator tương ứng.
 
-## 8. Code và giới hạn
+## 9. Code và giới hạn
 
 | File | Chức năng |
 |---|---|

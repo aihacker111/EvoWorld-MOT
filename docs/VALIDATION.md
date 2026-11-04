@@ -1,3 +1,5 @@
+Latest DDP/AMP checks: [DISTRIBUTED_VALIDATION.md](DISTRIBUTED_VALIDATION.md).
+
 # AL v0.2 validation — 2026-11-04
 
 Final automated suite: **29 passed in 13.34 seconds**, development Mac CPU. Ruff check and formatting passed. These are mechanism/integration checks, not evidence of trained real-world tracking accuracy or confirmed novelty.

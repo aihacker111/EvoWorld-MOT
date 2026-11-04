@@ -33,15 +33,15 @@ class ForecastCache:
     agent_count: int
 
     def summary(self, reference):
-        result = reference.new_zeros(self.agent_count, 4)
+        result = torch.zeros(self.agent_count, 4, device=reference.device, dtype=torch.float32)
         if len(self.indices):
             # One summary per selected identity, shared by all its action candidates.
             value = torch.stack(
                 (
-                    self.visibility.mean(0),
-                    self.sigma.mean((0, 2)),
-                    self.boxes[..., 2:].mean((0, 2)),
-                    self.visibility.var(0, unbiased=False),
+                    self.visibility.float().mean(0),
+                    self.sigma.float().mean((0, 2)),
+                    self.boxes[..., 2:].float().mean((0, 2)),
+                    self.visibility.float().var(0, unbiased=False),
                 ),
                 -1,
             )
@@ -50,17 +50,17 @@ class ForecastCache:
 
     def affinities(self, memory, measurement, gate, track_indices):
         """Evaluate a hypothetical memory without modifying physical futures or real memory."""
-        out = memory.new_zeros(*gate.shape, 2)
+        out = torch.zeros(*gate.shape, 2, device=memory.device, dtype=torch.float32)
         if not len(self.indices):
             return out
-        hypothetical = blend_memory(memory, measurement, gate)
+        hypothetical = blend_memory(memory.float(), measurement.float(), gate.float())
         for local, identity in enumerate(self.indices.tolist()):
             mask = track_indices == identity
             if not mask.any():
                 continue
-            expected = self.features[:, local].mean(0)
+            expected = self.features[:, local].float().mean(0)
             out[..., 0][mask] = (hypothetical[mask] * expected).sum(-1)
-            out[..., 1][mask] = self.visibility[:, local].mean()
+            out[..., 1][mask] = self.visibility[:, local].float().mean()
         return out
 
 

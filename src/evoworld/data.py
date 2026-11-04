@@ -264,3 +264,34 @@ class ClipSampler(Sampler):
 
     def __len__(self):
         return len(self.keys)
+
+
+class DistributedClipSampler(Sampler):
+    """Disjoint shuffled clips, no padding duplicates; drop at most world_size-1 per epoch.
+
+    start is a global sample offset and must lie at a synchronized rank boundary.
+    Dropped tail identities rotate with the epoch permutation.
+    """
+
+    def __init__(self, dataset, epoch, rank, world_size, start=0):
+        if not 0 <= rank < world_size or start < 0 or start % world_size:
+            raise ValueError("Invalid rank/world_size/global sample offset")
+        order = list(range(len(dataset)))
+        random.Random(dataset.config.seed + epoch).shuffle(order)
+        self.usable = len(order) // world_size * world_size
+        if self.usable == 0:
+            raise ValueError("Dataset must contain at least one clip per rank")
+        if start > self.usable:
+            raise ValueError("Checkpoint sample offset exceeds the distributed epoch size")
+        self.keys = [(epoch, index) for index in order[start : self.usable][rank::world_size]]
+
+    def __iter__(self):
+        return iter(self.keys)
+
+    def __len__(self):
+        return len(self.keys)
+
+
+def initialize_worker(_worker_id):
+    """Avoid OpenCV thread oversubscription with one loader pool per GPU."""
+    cv2.setNumThreads(1)

@@ -33,12 +33,18 @@ def environment():
     }
 
 
-def rng_state():
+def rng_state(device=None):
     return {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch": torch.get_rng_state(),
-        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "cuda": (
+            {"device": device.index, "state": torch.cuda.get_rng_state(device)}
+            if device is not None and device.type == "cuda"
+            else torch.cuda.get_rng_state_all()
+            if device is None and torch.cuda.is_available()
+            else None
+        ),
     }
 
 
@@ -47,10 +53,13 @@ def restore_rng(state):
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"])
     if state["cuda"] is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        if isinstance(state["cuda"], dict):
+            torch.cuda.set_rng_state(state["cuda"]["state"], state["cuda"]["device"])
+        else:
+            torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def save_checkpoint(path, model, optimizer, scaler, progress, provenance):
+def save_checkpoint(path, model, optimizer, scaler, progress, provenance, distributed=None):
     path = Path(path)
     temporary = path.with_suffix(".tmp")
     torch.save(
@@ -63,7 +72,8 @@ def save_checkpoint(path, model, optimizer, scaler, progress, provenance):
             "progress": progress,
             "provenance": provenance,
             "environment": environment(),
-            "rng": rng_state(),
+            "rng": distributed["rng_by_rank"][0] if distributed else rng_state(),
+            "distributed": distributed,
         },
         temporary,
     )
