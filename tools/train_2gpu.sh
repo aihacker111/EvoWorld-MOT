@@ -16,4 +16,4 @@ PY
 
 exec "$evoworld_python" -u "$evoworld_repo/tools/run_training.py" \
   --distributed --master-port "$evoworld_port" \
-  --config configs/full.yaml --batch-size 4 --grad-accumulation 2 --workers 1 "$@"
+  --config configs/full.yaml --batch-size 2 --grad-accumulation 4 --workers 1 "$@"
