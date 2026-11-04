@@ -89,6 +89,17 @@ python tools/convert_visdrone.py --root /absolute/path/VisDrone2019-MOT-train --
 python tools/convert_visdrone.py --root /absolute/path/VisDrone2019-MOT-val --out data/visdrone/val.json
 ```
 
+Converter mặc định đọc kích thước từ header ảnh, in tiến độ theo sequence và mỗi 500 frame, không decode toàn bộ pixel. Dùng `--progress-every 100` để log dày hơn; `--verify-images` để decode kiểm tra ảnh hỏng (chậm hơn). Output JSON được ghi qua file tạm rồi thay thế khi hoàn tất.
+
+Trên Kaggle, có thể truyền folder dataset bên ngoài và chọn split; converter tự tìm lớp folder chứa trực tiếp `annotations/` và `sequences/` trong tối đa 6 tầng, không quét sâu vào các ảnh:
+
+```bash
+python -u tools/convert_visdrone.py --root /kaggle/input/datasets/huynhlong111/visdrone2019-mot-datasets --split train --out /kaggle/working/Visdrone2019-COCO/train.json
+python -u tools/convert_visdrone.py --root /kaggle/input/datasets/huynhlong111/visdrone2019-mot-datasets --split val --out /kaggle/working/Visdrone2019-COCO/val.json
+```
+
+Thay `--root` bằng mount path thực tế nếu khác. Khi có nhiều root phù hợp, converter báo danh sách để chọn, không tự chọn ngẫu nhiên. Lệnh chạy sẽ in root và image root đã tìm được để điền config.
+
 Sửa bốn đường dẫn trong `configs/full.yaml`:
 
 ```yaml
