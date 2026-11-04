@@ -18,9 +18,9 @@ backend: falcon
 preprocess: imagenet_rgb
 width: 960
 height: 544
-train_annotations: /kaggle/working/Visdrone2019-COCO/train.json
+train_annotations: /kaggle/input/datasets/huynhlong111/visdrone2019-coco-json/train.json
 train_images: /kaggle/input/datasets/huynhlong111/visdrone2019-mot-datasets/VisDrone2019-MOT-train/VisDrone2019-MOT-train/sequences
-val_annotations: /kaggle/working/Visdrone2019-COCO/val.json
+val_annotations: /kaggle/input/datasets/huynhlong111/visdrone2019-coco-json/val.json
 val_images: /kaggle/input/datasets/huynhlong111/visdrone2019-mot-datasets/VisDrone2019-MOT-val/VisDrone2019-MOT-val/sequences
 embedding_dim: 128
 hidden_dim: 128
