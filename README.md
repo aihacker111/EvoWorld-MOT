@@ -140,6 +140,28 @@ bash tools/train.sh --config configs/compact.yaml --out runs/check_al --resume r
 
 CPU là mặc định trên Mac; CUDA tự chọn khi có. `--max-steps` là tổng optimizer updates, không phải số update thêm. Số update/epoch = `ceil(ceil(num_clips / batch_size) / grad_accumulation)`.
 
+### Chạy thử train → validation trước khi train dài
+
+`--max-steps` chỉ giới hạn tổng update và dừng, không ép chạy validation. Dùng flag riêng để kiểm tra luồng validation ngay:
+
+```bash
+bash tools/train_2gpu.sh --config configs/full.yaml \
+  --out /kaggle/working/runs/validation_check \
+  --init-checkpoint /kaggle/working/runs/al_2gpu/last.pt \
+  --validate-after-steps 2 --val-max-frames 100 --log-every 1
+```
+
+Trong Kaggle Notebook thêm `!` trước `bash`. Với một GPU dùng `tools/train.sh`. Cần cấu hình đúng `val_annotations` và `val_images`. Bỏ `--init-checkpoint` nếu không dùng weights đã train.
+
+- `--validate-after-steps N`: chạy **thêm N optimizer update thành công** tính từ lúc bắt đầu/resume, lưu `last.pt`, chạy validation rồi thoát; không phải N microbatch. AMP skips không được tính. Nếu hết số epoch cấu hình trước N update thì vẫn chạy validation một lần khi kết thúc.
+- `--val-max-frames N`: tối đa N frame trên toàn bộ validation, theo thứ tự sequence/frame, không phải N frame cho mỗi sequence. Chỉ dùng cùng `--validate-after-steps`; bỏ flag để kiểm tra full validation.
+- Log hiển thị `Validation SMOKE`, tiến độ frame và `Validation OK` kèm IDF1/MOTA/IDSW. Kết quả mẫu ngắn dùng kiểm tra code, không dùng kết luận chất lượng benchmark.
+- Kết quả thử lưu `validation_smoke.json` và `validation_smoke_uXXXXXX/metrics.json`, có `smoke_test`, `frames`, `available_frames`, `truncated`; không ghi đè `validation.json`/`best.pt` của full validation. Không đánh dấu epoch hoàn thành khi dừng giữa epoch.
+- Không kết hợp với `--max-steps`. Để train tiếp từ checkpoint cùng phiên bản code, bỏ hai flag thử nghiệm và dùng `--resume` với cùng cấu hình tối ưu/topology.
+- Bản sửa này thay đổi source fingerprint: checkpoint từ source cũ cần `--init-checkpoint` và thư mục output mới. Cách này giữ model weights/counters, khởi tạo lại optimizer/scaler/tiến độ.
+
+Đã sửa lỗi in-place autograd khi batch chứa nhiều clip và dùng assignment dự đoán: correction buffers được sở hữu riêng từng clip trước khi stack, tránh sửa mask/features mà backward của clip trước đang sử dụng. Có regression tests cho AL và legacy, train–validation thật với detector Falcon, và test hai tiến trình Gloo bật bằng `RUN_DISTRIBUTED_TESTS=1`.
+
 ## 5. Ngân sách và warmup
 
 Mặc định:

@@ -149,12 +149,16 @@ def training_objective(model, batch, epoch=0, step=0):
         predicted, info = model.world.predict(state, motion, batch["delta"][:, t], sample=model.training)
         observed = observed_sequence[:, t]
         measurement_boxes, measurement_features = appearances[t]
-        corrected_boxes, corrected_features = measurement_boxes.clone(), measurement_features.clone()
-        corrected_observed = observed.clone()
-        corrected_confidence = measurement_confidence[t].clone()
-        correct_identity = observed.clone()
+        corrected = []
         new_memory, new_anchor = [], []
         for b in range(B):
+            # Each clip owns its correction buffers. Views into a shared batch
+            # must not be mutated after another clip saves them for backward.
+            local_boxes = measurement_boxes[b].clone()
+            local_features = measurement_features[b].clone()
+            local_observed = observed[b].clone()
+            local_confidence = measurement_confidence[t][b].clone()
+            local_identity = observed[b].clone()
             local_forecast = {key: value[b : b + 1] for key, value in info.items()}
             if use_al:
                 current_agent = agents[b].predict(local_forecast, batch["delta"][b : b + 1, t], c)
@@ -206,22 +210,22 @@ def training_objective(model, batch, epoch=0, step=0):
             teacher = torch.rand((), device=images.device) < forcing
             if not teacher and learn_rows.any():
                 pairs = assign(scores.masked_fill(~learn_rows[:, None], -1e4), c.match_threshold)
-                corrected_observed[b] = observed[b] & ~learn_rows
-                correct_identity[b] = corrected_observed[b].clone()
+                local_observed = observed[b] & ~learn_rows
+                local_identity = local_observed.clone()
                 for i, j in pairs:
-                    corrected_boxes[b, i] = measurement_boxes[b, j]
-                    corrected_features[b, i] = measurement_features[b, j]
-                    corrected_observed[b, i] = True
-                    correct_identity[b, i] = i == j
-                    corrected_confidence[b, i] = measurement_confidence[t][b, j]
+                    local_boxes[i] = measurement_boxes[b, j]
+                    local_features[i] = measurement_features[b, j]
+                    local_observed[i] = True
+                    local_identity[i] = i == j
+                    local_confidence[i] = measurement_confidence[t][b, j]
             contexts = model.association.context(
                 predicted.h[b],
                 memory[b],
                 anchor[b],
-                corrected_features[b],
+                local_features,
                 predicted.box[b],
-                corrected_boxes[b],
-                corrected_confidence[b],
+                local_boxes,
+                local_confidence,
                 current_agent.age if use_al else images.new_zeros(N),
                 life_stats[:, 9] * 5 if use_al else images.new_zeros(N),
             )
@@ -235,18 +239,18 @@ def training_objective(model, batch, epoch=0, step=0):
                     summary,
                     gate,
                     memory[b],
-                    corrected_features[b],
-                    corrected_observed[b],
-                    correct_identity[b],
+                    local_features,
+                    local_observed,
+                    local_identity,
                 )
                 if t >= c.burn_in:
                     values["al_memory"] = values["al_memory"] + maintenance_loss / (B * (T - c.burn_in))
-                innovation = (corrected_boxes[b, :, :2] - predicted.box[b, :, :2]).norm(dim=-1)
+                innovation = (local_boxes[:, :2] - predicted.box[b, :, :2]).norm(dim=-1)
                 innovation = innovation / predicted.box[b, :, 2:].mean(-1).clamp_min(0.02)
                 agents[b] = current_agent.observe(
-                    corrected_observed[b],
-                    corrected_confidence[b],
-                    corrected_boxes[b],
+                    local_observed,
+                    local_confidence,
+                    local_boxes,
                     innovation,
                     policy["existence"].sigmoid(),
                     True,
@@ -254,20 +258,24 @@ def training_objective(model, batch, epoch=0, step=0):
                 )
             if t >= c.burn_in:
                 # Low-rate writes on consistent observations; counterfactual critic refines this policy.
-                target_gate = correct_identity[b].float() * 0.2
+                target_gate = local_identity.float() * 0.2
                 gate_loss = F.binary_cross_entropy_with_logits(
                     torch.logit(prior_gate.float().clamp(1e-5, 1 - 1e-5)),
                     target_gate.float(),
                     reduction="none",
                 )
-                values["gate"] = values["gate"] + masked_mean(gate_loss, corrected_observed[b]) / (
+                values["gate"] = values["gate"] + masked_mean(gate_loss, local_observed) / (
                     B * (T - c.burn_in)
                 )
-            born = corrected_observed[b] & ~state.valid[b]
-            updated = blend_memory(memory[b], corrected_features[b], gate)
-            updated = torch.where(born[:, None], corrected_features[b], updated)
-            new_memory.append(torch.where(corrected_observed[b, :, None], updated, memory[b]))
-            new_anchor.append(torch.where(born[:, None], corrected_features[b], anchor[b]))
+            born = local_observed & ~state.valid[b]
+            updated = blend_memory(memory[b], local_features, gate)
+            updated = torch.where(born[:, None], local_features, updated)
+            new_memory.append(torch.where(local_observed[:, None], updated, memory[b]))
+            new_anchor.append(torch.where(born[:, None], local_features, anchor[b]))
+            corrected.append((local_boxes, local_features, local_observed, local_confidence, local_identity))
+        corrected_boxes, corrected_features, corrected_observed, corrected_confidence, correct_identity = (
+            torch.stack(rows) for rows in zip(*corrected)
+        )
         memory, anchor = torch.stack(new_memory), torch.stack(new_anchor)
         state, kl = model.world.correct(
             predicted,

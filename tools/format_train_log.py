@@ -94,6 +94,9 @@ class TrainingConsole:
             return
         if "run" in record and "parameters" in record:
             self.start(record)
+        elif record.get("event", "").startswith("validation_"):
+            if self.mode != "quiet":
+                self.validation(record)
         elif record.get("event") == "amp_overflow":
             if self.mode != "quiet":
                 self.write(
@@ -105,6 +108,29 @@ class TrainingConsole:
             self.update(record)
         else:
             self.write(line.rstrip("\n"))
+
+    def validation(self, record):
+        event = record["event"]
+        if event == "validation_start":
+            if self.last is not None and self.last_printed != (self.last["epoch"], self.last["updates"]):
+                self.row(self.last)
+            limit = record.get("max_frames")
+            scope = f"up to {limit:,} frames" if limit is not None else "full dataset"
+            kind = "SMOKE" if record.get("smoke_test") else "FULL"
+            self.write(f"Validation {kind} | update {record['updates']} | {scope}")
+        elif event == "validation_progress":
+            self.write(f"VAL | {record['frames']:,}/{record['total_frames']:,} frames | {record['sequence']}")
+        elif event == "validation_end":
+            scope = "partial" if record.get("truncated") else "full"
+            self.write(
+                f"Validation OK | IDF1 {100 * record['idf1']:.2f}% | MOTA {100 * record['mota']:.2f}% "
+                f"| IDSW {record['id_switches']} | {record['frames']:,} frames ({scope}) "
+                f"| {duration(record['seconds'])}"
+            )
+            self.write(f"Validation results: {record['out']}")
+            self.rate = None
+            self.last = None
+        self.table_epoch = None
 
     def start(self, record):
         self.run = record["run"]

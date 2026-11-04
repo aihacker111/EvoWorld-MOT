@@ -17,6 +17,16 @@ def main():
     training.add_argument("--grad-accumulation", type=int)
     training.add_argument("--workers", type=int, help="DataLoader workers per GPU/process")
     training.add_argument("--max-steps", type=int, help="Stop after this total number of optimizer updates")
+    training.add_argument(
+        "--validate-after-steps",
+        type=int,
+        help="Run this many additional successful optimizer updates, validate, then exit (smoke test)",
+    )
+    training.add_argument(
+        "--val-max-frames",
+        type=int,
+        help="Limit total validation frames in --validate-after-steps mode; omit for full validation",
+    )
     inspect = commands.add_parser("inspect", help="Strictly load detector and report parameter counts")
     inspect.add_argument("--config", default="configs/full.yaml")
     synthetic = commands.add_parser("synthetic", help="Generate a tiny deterministic test dataset")
@@ -93,12 +103,27 @@ def main():
                 config.out = args.out
             if args.max_steps is not None and args.max_steps < 1:
                 parser.error("--max-steps must be positive")
+            if args.validate_after_steps is not None and args.validate_after_steps < 1:
+                parser.error("--validate-after-steps must be positive")
+            if args.val_max_frames is not None and args.val_max_frames < 1:
+                parser.error("--val-max-frames must be positive")
+            if args.val_max_frames is not None and args.validate_after_steps is None:
+                parser.error("--val-max-frames requires --validate-after-steps")
+            if args.validate_after_steps is not None and args.max_steps is not None:
+                parser.error("Choose --validate-after-steps or --max-steps")
             for option in ("batch_size", "grad_accumulation", "workers"):
                 value = getattr(args, option)
                 if value is not None:
                     setattr(config, option, value)
             config.validate()
-            checkpoint = train(config, args.resume, args.max_steps, args.init_checkpoint)
+            checkpoint = train(
+                config,
+                args.resume,
+                args.max_steps,
+                args.init_checkpoint,
+                validate_after_steps=args.validate_after_steps,
+                val_max_frames=args.val_max_frames,
+            )
         import os
 
         if int(os.environ.get("RANK", "0")) == 0:

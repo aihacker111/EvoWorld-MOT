@@ -50,17 +50,38 @@ def optimizer_step(model, optimizer, scaler, context, clip):
     return norm, not scaler.is_enabled() or scaler.get_scale() >= previous_scale
 
 
-def train(config: Config, resume=None, max_steps=None, init_checkpoint=None):
+def train(
+    config: Config,
+    resume=None,
+    max_steps=None,
+    init_checkpoint=None,
+    *,
+    validate_after_steps=None,
+    val_max_frames=None,
+):
     if resume and init_checkpoint:
         raise ValueError("Choose --resume or --init-checkpoint")
+    if validate_after_steps is not None:
+        if validate_after_steps < 1 or max_steps is not None:
+            raise ValueError(
+                "--validate-after-steps must be positive and cannot be combined with --max-steps"
+            )
+        if not config.val_annotations or not config.val_images:
+            raise ValueError("--validate-after-steps requires val_annotations and val_images in the config")
+    if val_max_frames is not None and (val_max_frames < 1 or validate_after_steps is None):
+        raise ValueError("Positive --val-max-frames requires --validate-after-steps")
     context = DistributedContext.initialize(config)
     try:
-        return _train(config, resume, max_steps, init_checkpoint, context)
+        return _train(
+            config, resume, max_steps, init_checkpoint, context, validate_after_steps, val_max_frames
+        )
     finally:
         context.close()
 
 
-def _train(config, resume, max_steps, init_checkpoint, context):
+def _train(
+    config, resume, max_steps, init_checkpoint, context, validate_after_steps=None, val_max_frames=None
+):
     setup(config)
     device = context.device
     out = resolve(config.out)
@@ -109,6 +130,11 @@ def _train(config, resume, max_steps, init_checkpoint, context):
         scaler.load_state_dict(checkpoint["scaler"])
         progress.update(checkpoint["progress"])
         restored_rng = saved["rng_by_rank"][context.rank] if "rng_by_rank" in saved else checkpoint["rng"]
+    if validate_after_steps is not None and progress["epoch"] >= config.epochs:
+        raise ValueError("Training is already complete; use the evaluate command for this checkpoint")
+    validation_target = (
+        progress["updates"] + validate_after_steps if validate_after_steps is not None else None
+    )
     step_model = context.wrap(model, training_objective)
     # Construction/broadcast happens before restoring each rank's stochastic stream.
     if restored_rng is not None:
@@ -164,6 +190,61 @@ def _train(config, resume, max_steps, init_checkpoint, context):
             print(json.dumps(record, allow_nan=False), flush=True)
             with (out / "metrics.jsonl").open("a") as file:
                 file.write(json.dumps(record, allow_nan=False) + "\n")
+
+    def run_validation(smoke=False):
+        # Every rank enters primary_call; only rank 0 executes the evaluator.
+        # A smoke result must never replace full validation.json or best.pt.
+        destination = out / (
+            f"validation_smoke_u{progress['updates']:06d}" if smoke else f"validation_{progress['epoch']:03d}"
+        )
+
+        def validation():
+            from evoworld.evaluate import evaluate
+
+            before = rng_state(device)
+            validation_started = time.monotonic()
+            log_record(
+                dict(
+                    event="validation_start",
+                    smoke_test=smoke,
+                    updates=progress["updates"],
+                    out=str(destination),
+                    max_frames=val_max_frames if smoke else None,
+                )
+            )
+            try:
+                result = evaluate(
+                    model.eval(),
+                    config.val_annotations,
+                    config.val_images,
+                    destination,
+                    device,
+                    max_frames=val_max_frames if smoke else None,
+                    progress=lambda record: log_record(dict(event="validation_progress", **record)),
+                )
+                if smoke:
+                    result = dict(result, smoke_test=True, updates=progress["updates"])
+                    atomic_json(destination / "metrics.json", result)
+                atomic_json(out / ("validation_smoke.json" if smoke else "validation.json"), result)
+                log_record(
+                    dict(
+                        event="validation_end",
+                        smoke_test=smoke,
+                        seconds=time.monotonic() - validation_started,
+                        idf1=result["idf1"],
+                        mota=result["mota"],
+                        id_switches=result["id_switches"],
+                        frames=result["frames"],
+                        truncated=result["truncated"],
+                        out=str(destination),
+                    )
+                )
+                return result
+            finally:
+                model.train()
+                restore_rng(before)
+
+        return context.primary_call(validation)
 
     started = time.monotonic()
     optimizer.zero_grad(set_to_none=True)
@@ -280,34 +361,26 @@ def _train(config, resume, max_steps, init_checkpoint, context):
                 )
             log_record(log)
             group_size, samples_in_group, pending, records = 0, 0, [0, 0, 0], []
-            stopping = max_steps is not None and progress["updates"] >= max_steps
+            validate_stopping = validation_target is not None and progress["updates"] >= validation_target
+            stopping = validate_stopping or (max_steps is not None and progress["updates"] >= max_steps)
             if progress["updates"] == 1 or progress["updates"] % config.checkpoint_every == 0 or stopping:
                 checkpoint_at(out / "last.pt")
             if stopping:
+                if validate_stopping:
+                    run_validation(smoke=True)
                 return out / "last.pt"
         progress["epoch"] += 1
         progress["offset"] = 0
-        if config.val_annotations and progress["epoch"] % config.validate_every == 0:
-
-            def validation():
-                from evoworld.evaluate import evaluate
-
-                try:
-                    result = evaluate(
-                        model.eval(),
-                        config.val_annotations,
-                        config.val_images,
-                        out / f"validation_{progress['epoch']:03d}",
-                        device,
-                    )
-                    atomic_json(out / "validation.json", result)
-                    return result
-                finally:
-                    model.train()
-
-            result = context.primary_call(validation)
+        if (
+            validation_target is None
+            and config.val_annotations
+            and progress["epoch"] % config.validate_every == 0
+        ):
+            result = run_validation()
             if result["idf1"] > progress["best_idf1"]:
                 progress["best_idf1"] = result["idf1"]
                 checkpoint_at(out / "best.pt")
         checkpoint_at(out / "last.pt")
+    if validation_target is not None:
+        run_validation(smoke=True)
     return out / "last.pt"

@@ -73,6 +73,36 @@ def test_compact_table_and_raw_metrics_remain_untouched(tmp_path, monkeypatch):
     assert path.read_text() == raw
 
 
+def test_validation_events_are_readable_and_clear_training_eta(tmp_path, monkeypatch):
+    renderer, output = console(tmp_path, monkeypatch)
+    renderer.consume(json.dumps(record(1)) + "\n")
+    renderer.consume(
+        json.dumps(dict(event="validation_start", smoke_test=True, updates=1, max_frames=3)) + "\n"
+    )
+    renderer.consume(
+        json.dumps(dict(event="validation_progress", frames=3, total_frames=3, sequence="test")) + "\n"
+    )
+    renderer.consume(
+        json.dumps(
+            dict(
+                event="validation_end",
+                idf1=0.5,
+                mota=0.3,
+                id_switches=1,
+                frames=3,
+                seconds=2,
+                truncated=True,
+                out=str(tmp_path),
+            )
+        )
+        + "\n"
+    )
+    text = output.getvalue()
+    assert "Validation SMOKE" in text and "3/3 frames" in text
+    assert "Validation OK | IDF1 50.00%" in text and "partial" in text
+    assert renderer.last is None and renderer.rate is None
+
+
 def test_throttles_rows_but_always_flushes_last_update(tmp_path, monkeypatch):
     renderer, output = console(tmp_path, monkeypatch, every=10)
     for i in range(1, 26):

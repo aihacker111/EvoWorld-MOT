@@ -117,12 +117,22 @@ def ignore_unmatched(pred_boxes, gt_boxes, gt_classes, pred_classes, ignored, fr
 
 
 @torch.no_grad()
-def evaluate(model, annotations, images, out, device="cpu", hota=False):
+def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_frames=None, progress=None):
+    if max_frames is not None and max_frames < 1:
+        raise ValueError("max_frames must be positive")
     if model.config.backend != "falcon":
         raise ValueError("Benchmark evaluation requires the real Falcon detector")
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     video = CocoVideo(annotations, images, model.config)
+    available_frames = sum(len(frames) for frames in video.sequences.values())
+    total_frames = min(available_frames, max_frames) if max_frames is not None else available_frames
+    processed = 0
+
+    def report(sequence):
+        if progress is not None:
+            progress(dict(sequence=sequence, frames=processed, total_frames=total_frames))
+
     payload = json.loads(resolve(str(annotations)).read_text())
     ignored = defaultdict(list)
     for a in payload.get("annotations", []):
@@ -130,6 +140,10 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False):
             ignored[a["image_id"]].append(a)
     counts, sequence_results, hota_results = [], {}, {}
     for seq, frames in sorted(video.sequences.items()):
+        if processed >= total_frames:
+            break
+        frames = frames[: total_frames - processed]
+        report(seq)
         tracker = EcologyTracker(model)
         metrics = IdentityMetrics()
         previous, previous_boxes = None, np.empty((0, 4), np.float32)
@@ -182,6 +196,9 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False):
                     dict(frame=frame["frame_id"], id=identity, category_id=model.config.category_ids[cls])
                 )
             previous, previous_boxes = resized, detection["boxes"].cpu().numpy()
+            processed += 1
+            if processed % 50 == 0:
+                report(seq)
         # No path traversal through user-provided sequence names.
         safe_seq = seq.replace("/", "_").replace("\\", "_").replace("..", "_")
         (out / f"{safe_seq}.txt").write_text("".join(lines))
@@ -189,6 +206,7 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False):
         result = metrics.counts()
         sequence_results[seq] = summarize([result])
         counts.append(result)
+        report(seq)
         if hota:
             try:
                 from trackeval.metrics import HOTA
@@ -215,6 +233,10 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False):
         category_ids=model.config.category_ids,
         iou_threshold=0.5,
         protocol="Class-aware COCO-MOT; explicit ignore regions; not official VisDrone preprocessing",
+        frames=processed,
+        available_frames=available_frames,
+        max_frames=max_frames,
+        truncated=processed < available_frames,
     )
     if hota:
         from trackeval.metrics import HOTA
