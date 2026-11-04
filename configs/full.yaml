@@ -1,6 +1,6 @@
 # Joint perception, world model and per-track life policies.
 detector_yaml: configs/falcon_detector.yaml
-detector_checkpoint: weights/falcon_detector.pth
+detector_checkpoint: /kaggle/input/datasets/huynhlong111/falcon-detector-ckpt/falcon_detector.pth
 detector_scale: s
 num_classes: 10
 category_ids:
