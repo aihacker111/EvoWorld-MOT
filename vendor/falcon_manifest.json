@@ -1,0 +1,30 @@
+[
+  {
+    "source": "/Users/tinvo0908/Desktop/Falcon-MOT/falconmot/cfg/yolo_falcon_lqcv2_baseline.yaml",
+    "destination": "configs/falcon_detector.yaml",
+    "sha256": "78e1fbde8e6ec8b2b4e35bdc7ba69f8bceb7c5e31c676a4c28a0e287ade387c4",
+    "vendored_sha256": "78e1fbde8e6ec8b2b4e35bdc7ba69f8bceb7c5e31c676a4c28a0e287ade387c4",
+    "transformation": "Byte-for-byte copy"
+  },
+  {
+    "source": "/Users/tinvo0908/Desktop/Falcon-MOT/falconmot/nn/modules/jde_reid.py",
+    "destination": "src/evoworld/models/reid.py",
+    "sha256": "0d46894e073a14ce4222b6641379d082e977425004258b2f140a737656e2cc8d",
+    "vendored_sha256": "056a08997a116305d5e6939f1aacb4b496df37a9ea628dc888fdaa122f380235",
+    "transformation": "Formatting and unused-import cleanup"
+  },
+  {
+    "source": "/Users/tinvo0908/Desktop/Falcon-MOT/LICENSE",
+    "destination": "LICENSE",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "vendored_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "transformation": "Byte-for-byte copy"
+  },
+  {
+    "source": "/Users/tinvo0908/Desktop/Falcon-MOT/pretrained_model/falcon_yolo_lqcv2_baseline_det.pth",
+    "destination": "weights/falcon_detector.pth",
+    "sha256": "5eab076f2b991e82fedd410c7e0381542320cce2b93385fb9c55ddea78708aad",
+    "vendored_sha256": "5eab076f2b991e82fedd410c7e0381542320cce2b93385fb9c55ddea78708aad",
+    "transformation": "Byte-for-byte copy"
+  }
+]

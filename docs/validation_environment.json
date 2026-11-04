@@ -1,0 +1,11 @@
+{
+  "torch": "2.5.1",
+  "torchvision": "0.2.2",
+  "numpy": "2.2.5",
+  "scipy": "1.15.3",
+  "opencv-python": "4.11.0.86",
+  "pytest": "9.0.2",
+  "ruff": "0.11.13",
+  "ultralytics": "8.3.221 (isolated temporary install)",
+  "trackeval": "1.3.0 (isolated temporary install)"
+}

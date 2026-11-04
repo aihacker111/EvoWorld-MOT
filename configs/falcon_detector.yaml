@@ -1,0 +1,130 @@
+# ==============================================================================
+# FALCON-YOLO v7 PAN-FPN [P2, P3, P4] — BASELINE (w/o EAD, w/o LQC)
+# Triple-Fusion Multi-Scale Neck for UAV / Tiny Object Detection
+# 29 layers (0..28). Strides: P2 (s=4), P3 (s=8), P4 (s=16). No P5 head.
+#
+# ------------------------------------------------------------------------------
+# WHAT THIS FILE IS
+# ------------------------------------------------------------------------------
+# The controlled ablation partner of ``yolo_falcon_lqcv2.yaml``. It is an
+# INDEX-FOR-INDEX mirror: 29 layers, same ``from`` graph, same channel widths,
+# same Detect sources [21, 24, 27]. The ONLY differences are the module types:
+#
+#   layer 1, 3, 5, 7   EAD           -> Conv          (same c1, c2, k, s)
+#   layer 4, 6, 8      C3k2LQC       -> C3k2          (same args)
+#   layer 11           LatentRefresh -> nn.Identity   (tensor pass-through)
+#   layer 21           LQCInject     -> nn.Identity   (tensor pass-through)
+#
+# Index parity is the point, not a coincidence:
+#   * the ablation isolates EAD + LQC and nothing else -- the neck topology,
+#     including the layer-23 triple fusion, is byte-identical;
+#   * ``YoloFalconModel._load_pretrained`` needs ZERO changes (see below);
+#   * ``link_lqc()`` is skipped automatically because no ``C3k2LQC`` exists.
+#
+# ------------------------------------------------------------------------------
+# WHY THE s=32 BRANCH STAYS
+# ------------------------------------------------------------------------------
+# Layers 7-11 are kept even though no head sits at stride 32. P5 is not an
+# unused branch -- it is the dominant input to the whole top-down path:
+#
+#   L11 (P5 out) -> L12 Upsample -> L13 Concat[-1, 6] -> L14 P4_td -> everything
+#
+# At layer 13 P5 contributes 512 of 768 input channels (67%, scale ``s``), and
+# all three Detect inputs inherit it. Deleting the branch would also (a) force
+# SPPF/C2PSA down to s=16 where the attention costs ~8x more (0.27 -> 2.13
+# GFLOPs at 960x544) and risks OOM, (b) make SPPF/C2PSA unable to load COCO
+# weights at all (channel widths halve), and (c) change two factors at once so
+# the delta could no longer be attributed to EAD+LQC.
+#
+# Do NOT use ``yolo-falcon_baseline_v11.yaml`` as the ablation partner either:
+# that file has 27 layers and a two-way concat at its P3_out, so it drops EAD,
+# LQC *and* the triple fusion together, and the remap table below misaligns.
+#
+# ------------------------------------------------------------------------------
+# PRETRAINED LOADING -- no code change required
+# ------------------------------------------------------------------------------
+# (A) COCO Ultralytics ``yolo11{n,s,m,l,x}.pt`` via ``--yolo_weights``.
+#     ``_is_original_yolo11()`` returns False (29 layers), ``is_falcon`` is False
+#     (no ``model.27./model.28.`` keys), so the COCO remap table in
+#     ``falconmot/nn/models/model.py`` runs. It resolves exactly for this graph
+#     (channels verified for scale ``s``: width 0.50, max_channels 1024):
+#
+#       COCO layer           ->  this file         shape
+#       model.0..model.10    ->  same index        identical (stem..SPPF/C2PSA)
+#       model.13 (P4_td)     ->  model.14          768 -> 256
+#       model.16 (P3_td)     ->  model.17          512 -> 128
+#       model.17 (down)      ->  model.25          128 -> 128
+#       model.19 (P4_out)    ->  model.27          384 -> 256
+#       clone model.17*      ->  model.24          512 -> 128 (triple fusion in == 512)
+#       clone model.17*      ->  model.20          cv1 sliced to 256 (P2_td in == 256)
+#       clone model.25*      ->  model.22          128 -> 128
+#       model.23.cv2.0/cv3.0 ->  model.28.cv2.1/cv3.1
+#       model.23.cv2.1/cv3.1 ->  model.28.cv2.2/cv3.2
+#       clone model.28.*.1   ->  model.28.*.0      new P2 head
+#     (*) the clone loop reads keys the table above has ALREADY renamed.
+#     Layers 11 and 21 are nn.Identity: zero parameters, nothing to map.
+#     The class-prediction convs (``cv3.*.2.*``) stay random whenever nc != 80.
+#
+# (B) A Falcon lqcv2 ``.pth`` via ``--yolo_weights`` (warm start).
+#     ``is_falcon`` is True, so the direct v7 path loads by matching index+shape.
+#     ``EAD`` subclasses ``Conv`` and ``C3k2LQC`` subclasses ``C3k2``, so every
+#     ``model.N.conv.*`` / ``model.N.bn.*`` / C3k2 tensor transfers verbatim; the
+#     LQC-only tensors (``tau``, ``modulator.*``, ``refine.*``, ``proj.*``,
+#     ``alpha``, ``gamma``, ``lqc.*``) find no destination and are dropped.
+#     Use this only for a warm start -- for a clean ablation train both variants
+#     from the same COCO weights.
+#
+# ``nc`` is overwritten at build time by ``opt.num_classes``
+# (= ``len(--reid_cls_ids)``); the value below is only a placeholder.
+# ==============================================================================
+nc: 1
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv,  [64, 3, 2]]             # 0  (s=2,  ch=64)   Stem
+  - [-1, 1, Conv,  [128, 3, 2]]            # 1  (s=4,  ch=128)  <- EAD P2
+  - [-1, 2, C3k2,  [256, False, 0.25]]     # 2  (s=4,  ch=256)  P2 Backbone
+  - [-1, 1, Conv,  [256, 3, 2]]            # 3  (s=8,  ch=256)  <- EAD P3
+  - [-1, 2, C3k2,  [512, False, 0.25]]     # 4  (s=8,  ch=512)  P3 Backbone  <- C3k2LQC
+  - [-1, 1, Conv,  [512, 3, 2]]            # 5  (s=16, ch=512)  <- EAD P4
+  - [-1, 2, C3k2,  [512, True]]            # 6  (s=16, ch=512)  P4 Backbone  <- C3k2LQC
+  - [-1, 1, Conv,  [1024, 3, 2]]           # 7  (s=32, ch=1024) <- EAD P5
+  - [-1, 2, C3k2,  [1024, True]]           # 8  (s=32, ch=1024) P5 Backbone  <- C3k2LQC
+  - [-1, 1, SPPF,  [1024, 5]]              # 9  (s=32, ch=1024)
+  - [-1, 2, C2PSA, [1024]]                 # 10 (s=32, ch=1024) P5 Out
+  - [-1, 1, nn.Identity, []]               # 11 (s=32, ch=1024) <- LatentRefresh (no-op)
+
+head:
+  # -------------------- TOP-DOWN (FPN) --------------------
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 12 (s=16, ch=1024)
+  - [[-1, 6], 1, Concat, [1]]                  # 13 (s=16, ch=1536)
+  - [-1, 2, C3k2, [512, False]]                # 14 (s=16, ch=512)  P4_td
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 15 (s=8,  ch=512)
+  - [[-1, 4], 1, Concat, [1]]                  # 16 (s=8,  ch=1024)
+  - [-1, 2, C3k2, [256, False]]                # 17 (s=8,  ch=256)  P3_td
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 18 (s=4,  ch=256)
+  - [[-1, 2], 1, Concat, [1]]                  # 19 (s=4,  ch=512)
+  - [-1, 2, C3k2, [256, False]]                # 20 (s=4,  ch=256)  P2_td
+
+  # -------------------- CONTEXT INJECTION (ablated) -------
+  - [-1, 1, nn.Identity, []]                   # 21 (s=4,  ch=256)  P2_out  <- LQCInject (no-op)
+
+  # -------------------- BOTTOM-UP (PAN-FPN) ---------------
+  - [-1, 1, Conv, [256, 3, 2]]                 # 22 (s=8,  ch=256)  Down P2_out -> S8
+  - [[-1, 17, 4], 1, Concat, [1]]              # 23 (s=8,  ch=1024) Triple Fusion: Down(P2_out) + P3_td + P3_Backbone
+  - [-1, 2, C3k2, [256, False]]                # 24 (s=8,  ch=256)  P3_out
+
+  - [-1, 1, Conv, [256, 3, 2]]                 # 25 (s=16, ch=256)  Down P3_out -> S16
+  - [[-1, 14], 1, Concat, [1]]                 # 26 (s=16, ch=768)  Concat with P4_td
+  - [-1, 2, C3k2, [512, False]]                # 27 (s=16, ch=512)  P4_out
+
+  # -------------------- 3-HEAD DETECT ---------------------
+  - [[21, 24, 27], 1, Detect, [nc]]            # 28 Detect(P2_out, P3_out, P4_out)

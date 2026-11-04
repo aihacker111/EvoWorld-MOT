@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evoworld-mot"
+version = "0.2.0"
+description = "Object-centric recurrent world models and ecological identity inference for aerial MOT"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {file = "LICENSE"}
+dependencies = [
+  "torch>=2.5,<2.7", "torchvision>=0.20,<0.22", "ultralytics==8.3.221",
+  "numpy>=1.26,<3", "scipy>=1.12", "opencv-python>=4.10",
+  "PyYAML>=6", "Pillow>=10", "tqdm>=4.66"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.9"]
+evaluation = ["trackeval==1.3.0"]
+
+[project.scripts]
+evoworld = "evoworld.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

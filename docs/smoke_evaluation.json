@@ -1,0 +1,45 @@
+{
+  "gt": 36,
+  "predictions": 0,
+  "tp": 0,
+  "idtp": 0,
+  "id_switches": 0,
+  "fp": 0,
+  "fn": 36,
+  "idf1": 0.0,
+  "mota": 0.0,
+  "precision": 0.0,
+  "recall": 0.0,
+  "sequences": {
+    "crossing": {
+      "gt": 36,
+      "predictions": 0,
+      "tp": 0,
+      "idtp": 0,
+      "id_switches": 0,
+      "fp": 0,
+      "fn": 36,
+      "idf1": 0.0,
+      "mota": 0.0,
+      "precision": 0.0,
+      "recall": 0.0
+    }
+  },
+  "category_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "iou_threshold": 0.5,
+  "protocol": "Class-aware COCO-MOT; explicit ignore regions; not official VisDrone preprocessing",
+  "hota": 0.0,
+  "assa": 0.0,
+  "deta": 0.0
+}
