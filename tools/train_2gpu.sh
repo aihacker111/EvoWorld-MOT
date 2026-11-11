@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One process per GPU, effective batch 1 * 2 accumulation * 2 GPUs = 4 clips.
+# One process per GPU; defaults: batch 2 * 4 accumulation * 2 GPUs = 16 clips.
 set -euo pipefail
 
 evoworld_repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -11,7 +11,7 @@ cd "$evoworld_repo"
 import torch
 if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
     raise SystemExit('This launcher needs two visible CUDA GPUs. Enable both GPUs before launching.')
-print('Using CUDA GPUs 0 and 1; effective batch=4 clips by default.', flush=True)
+print('Using CUDA GPUs 0 and 1; effective batch is reported below after CLI overrides.', flush=True)
 PY
 
 exec "$evoworld_python" -u "$evoworld_repo/tools/run_training.py" \

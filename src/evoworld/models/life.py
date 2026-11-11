@@ -7,10 +7,18 @@ change its memory and decisions, but never changes a cached physical forecast.
 from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 from enum import IntEnum
+import math
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 from .world import mlp
+
+
+def saturate(value, scale):
+    """Bounded count feature 1-exp(-x/scale); identical range in short clips and long videos."""
+    if not torch.is_tensor(value):
+        return 1.0 - math.exp(-float(value) / scale)
+    return 1.0 - torch.exp(-value.float() / scale)
 
 
 class Phase(IntEnum):
@@ -56,14 +64,36 @@ class AgentState:
             **{f.name: torch.cat((getattr(self, f.name), getattr(other, f.name))) for f in fields(self)}
         )
 
-    def predict(self, forecast, delta, config):
+    def predict(self, forecast, delta, config, boxes=None):
         dt = delta.reshape(-1)[0]
+        variance = (self.variance + forecast["log_sigma"][0, :, :2].exp().square() * dt).clamp_max(1.0)
+        if boxes is not None and config.dormant_std_cap > 0:
+            # Bounded search: missing agents cannot drift into a whole-image search region.
+            cap = (config.dormant_std_cap * boxes[..., 2:].detach().float() + 0.01).square()
+            variance = torch.minimum(variance, cap.to(variance))
         return replace(
             self,
-            variance=(self.variance + forecast["log_sigma"][0, :, :2].exp().square() * dt).clamp_max(1.0),
+            variance=variance,
             age=self.age + dt.long(),
             lifetime=self.lifetime + dt.long(),
             credit=(self.credit + config.al_credit_refill * dt).clamp_max(config.al_credit_capacity),
+        )
+
+    def with_history(self, born, config):
+        """Training only: random prior history for newly observed agents.
+
+        Training clips are short, while deployed agents live for hundreds of frames.
+        Offsets let saturating hit/lifetime statistics cover the deployed range.
+        """
+        if config.random_agent_history <= 0 or not born.any():
+            return self
+        draw = born & (torch.rand(born.shape, device=born.device) < config.random_agent_history)
+        hits = torch.randint(0, 30, born.shape, device=born.device)
+        lifetime = hits + torch.randint(0, 200, born.shape, device=born.device)
+        return replace(
+            self,
+            hits=torch.where(draw, self.hits + hits, self.hits),
+            lifetime=torch.where(draw, self.lifetime + lifetime, self.lifetime),
         )
 
     def statistics(self, predicted, forecast, scores, config):
@@ -84,9 +114,9 @@ class AgentState:
                 self.existence,
                 self.variance[:, 0].sqrt(),
                 self.variance[:, 1].sqrt(),
-                self.age.float() / max(1, config.al_max_dormant_age),
-                self.hits.float().clamp_max(10) / 10,
-                self.lifetime.float().clamp_max(100) / 100,
+                saturate(self.age, 10.0),
+                saturate(self.hits, 5.0),
+                saturate(self.lifetime, 30.0),
                 self.error,
                 (self.phase == Phase.DORMANT).float(),
                 top.clamp(-10, 10) / 5,
@@ -134,7 +164,7 @@ class LifeController(nn.Module):
         stats = confidence.new_zeros(len(confidence), cls.statistics_dim)
         stats[:, 0] = 0.5 + 0.5 * confidence
         stats[:, 1:3] = 0.01
-        stats[:, 4], stats[:, 5], stats[:, 10:12] = 0.1, 0.01, 1.0
+        stats[:, 4], stats[:, 5], stats[:, 10:12] = saturate(1, 5.0), saturate(1, 30.0), 1.0
         stats[:, 12] = min(3.0, config.al_credit_capacity) / config.al_credit_capacity
         return stats
 

@@ -1,12 +1,33 @@
-"""Per-identity life agents with learned maintenance and bounded acquisition."""
+"""Per-identity life agents with learned maintenance and bounded acquisition.
+
+Association runs in two stages.  Stage one scores confident detections with the
+learned agent/critic utilities.  Stage two lets recently seen agents claim
+remaining low-confidence boxes by IoU only, without writing their appearance.
+"""
 
 from __future__ import annotations
+from dataclasses import fields
 import torch
-from evoworld.geometry import sample_features, warp_boxes
-from evoworld.models.world import ObjectState
+from evoworld.geometry import sample_features, warp_boxes, pair_iou
+from evoworld.classes import same_group
+from evoworld.models.world import ObjectState, damp_missing
 from evoworld.models.life import AgentState, Phase, uncertainty_forecast
-from evoworld.models.association import blend_memory, assign_with_null
+from evoworld.models.association import blend_memory, assign, assign_with_null
 from evoworld.planning import ComputeBudget, allocate_planning, imagine, pooled_features, select_objects
+
+
+def policy_ready(model, config):
+    mode = config.al_inference_policy
+    if mode == "auto":
+        return int(model.al.policy_examples) >= config.al_min_examples
+    return mode == "on"
+
+
+def critic_ready(model, config):
+    mode = config.al_inference_critic
+    if mode == "auto":
+        return int(model.al.critic_examples) >= config.al_critic_min_examples
+    return mode == "on"
 
 
 class LifeTracker:
@@ -17,10 +38,19 @@ class LifeTracker:
     def reset(self):
         self.state = None
         self.agents = None
-        self.memory = self.anchor = self.classes = self.ids = None
+        self.memory = self.anchor = self.votes = self.ids = None
+        self.pending = []
         self.camera_state = self.previous_camera = self.previous_frame = None
         self.next_id = 1
         self.last_diagnostics = {}
+        self.last_backfill = []
+
+    @property
+    def classes(self):
+        """Track class = confidence-weighted majority of its observed detector classes."""
+        if self.votes is None:
+            return None
+        return self.votes.argmax(-1)
 
     @torch.no_grad()
     def step(self, detections, dense, camera, frame_id, affine=None):
@@ -32,29 +62,47 @@ class LifeTracker:
         self.camera_state, learned = model.camera.observe(camera, previous, self.camera_state)
         motion = learned if affine is None else affine.reshape(1, 2, 3).to(camera)
         boxes, confidence, classes = (detections[k] for k in ("boxes", "scores", "classes"))
-        features = sample_features(dense, boxes[None])[0]
+        # Center features are the only appearance written to memory/world/birth, as in training.
+        center = sample_features(dense, boxes[None])[0]
         if self.state is None:
             self.state = model.world.initial(dense, 1, 0)
             self.agents = AgentState.initial(dense, 0)
             self.memory = dense.new_empty(0, c.embedding_dim)
             self.anchor = self.memory.clone()
             self.ids = torch.empty(0, dtype=torch.long, device=dense.device)
-            self.classes = self.ids.clone()
+            self.votes = dense.new_zeros(0, c.num_classes)
         n, m = len(self.ids), len(boxes)
+        high = (confidence >= c.conf_threshold).nonzero().flatten()
+        low = (confidence < c.conf_threshold).nonzero().flatten()
         budget = ComputeBudget(c.al_compute_budget)
-        matched, output, terminated = set(), [], []
-        ready = int(model.al.policy_examples) >= c.al_min_examples
-        critic_ready = int(model.al.critic_examples) >= c.al_critic_min_examples
+        matched, output, terminated, recovered, backfill = set(), [], [], [], []
+        ready, judged = policy_ready(model, c), critic_ready(model, c)
+        observed = torch.zeros(1, n, dtype=torch.bool, device=boxes.device)
         if n:
             predicted, forecast = model.world.predict(self.state, motion, dt)
-            agents = self.agents.predict(forecast, dt, c)
+            agents = self.agents.predict(forecast, dt, c, predicted.box[0])
             inflated = uncertainty_forecast(forecast, agents)
-            scores = model.association.scores(
-                predicted, self.memory, self.anchor, boxes, features, self.classes, classes, inflated
-            )
+            track_classes = self.classes
+            features = center.clone()
+
+            def score(columns, values):
+                return model.association.scores(
+                    predicted,
+                    self.memory,
+                    self.anchor,
+                    boxes[columns],
+                    values[columns],
+                    track_classes,
+                    classes[columns],
+                    inflated,
+                    confidence[columns],
+                )
+
+            everything = torch.arange(m, device=boxes.device)
+            scores = score(everything, features)
+            # Statistics see every candidate, matching training where distractors are present.
             statistics = agents.statistics(predicted, forecast, scores, c)
             policies = model.al.agents(predicted.h[0], statistics)
-            # Learned request value is compared with explicit acquisition cost after warmup.
             ambiguous = (statistics[:, 9] < c.uncertain_margin / 5) | (agents.age > 1)
             eligibility = (policies["resource"][:, 0] > c.al_acquisition_cost) if ready else ambiguous
             eligibility &= agents.credit >= c.al_plan_horizon
@@ -65,16 +113,16 @@ class LifeTracker:
                 model, predicted, model.camera.imagine(self.camera_state), selected, c.al_plan_horizon
             )
             summary = cache.summary(self.memory)
-            # Each additional ROI is computed once even if multiple agents request it.
-            if m:
+            if len(high):
+                # ROI rechecks refine scoring only; each pooled detection is computed once.
                 priority = policies["resource"][:, 1]
-                order = priority.argsort(descending=True)
                 requests = (priority > c.al_acquisition_cost) if ready else ambiguous
                 queried = set()
-                for i in order.tolist():
-                    if not requests[i] or agents.credit[i] < 1 or not torch.isfinite(scores[i]).any():
+                for i in priority.argsort(descending=True).tolist():
+                    row = scores[i, high]
+                    if not requests[i] or agents.credit[i] < 1 or not torch.isfinite(row).any():
                         continue
-                    j = int(scores[i].argmax())
+                    j = int(high[row.argmax()])
                     if j in queried:
                         continue
                     if not budget.spend(1, "roi"):
@@ -83,9 +131,7 @@ class LifeTracker:
                     agents.credit[i] -= 1
                     queried.add(j)
                 if queried:
-                    scores = model.association.scores(
-                        predicted, self.memory, self.anchor, boxes, features, self.classes, classes, inflated
-                    )
+                    scores = score(everything, features)
             adjusted, chosen_gate, null = self._decisions(
                 predicted,
                 agents,
@@ -93,35 +139,47 @@ class LifeTracker:
                 policies,
                 summary,
                 cache,
-                scores,
-                boxes,
-                features,
-                confidence,
+                scores[:, high],
+                boxes[high],
+                center[high],
+                confidence[high],
                 ready,
-                critic_ready,
+                judged,
             )
-            pairs = assign_with_null(adjusted, null)
-            observed = torch.zeros(1, n, dtype=torch.bool, device=boxes.device)
+            pairs = [(i, int(high[k]), chosen_gate[i, k]) for i, k in assign_with_null(adjusted, null)]
+            # Stage two: recently seen agents keep low-confidence (often occluded) evidence.
+            taken = {i for i, _, _ in pairs}
+            waiting = [i for i in range(n) if i not in taken and int(agents.age[i]) <= c.low_conf_max_age]
+            if waiting and len(low):
+                rows = torch.tensor(waiting, device=boxes.device)
+                overlap = pair_iou(predicted.box[0, rows], boxes[low])
+                compatible = same_group(track_classes[rows], classes[low], c)
+                overlap = overlap.masked_fill(~compatible, -1.0)
+                for a, k in assign(overlap, c.low_conf_iou):
+                    pairs.append((waiting[a], int(low[k]), boxes.new_zeros(())))
             measured, appearance = predicted.box.clone(), self.memory.clone()
             memory = self.memory.clone()
+            votes = self.votes * 0.98
             measured_confidence = boxes.new_zeros(n)
             innovation = boxes.new_zeros(n)
-            recovered = []
-            for i, j in pairs:
+            for i, j, gate in pairs:
                 matched.add(j)
                 observed[0, i] = True
-                measured[0, i], appearance[i] = boxes[j], features[j]
+                measured[0, i], appearance[i] = boxes[j], center[j]
                 measured_confidence[i] = confidence[j]
                 innovation[i] = (boxes[j, :2] - predicted.box[0, i, :2]).norm() / predicted.box[
                     0, i, 2:
                 ].mean().clamp_min(0.02)
-                memory[i] = blend_memory(self.memory[i], features[j], chosen_gate[i, j])
+                memory[i] = blend_memory(self.memory[i], center[j], gate)
+                votes[i, classes[j]] += confidence[j]
                 if self.agents.phase[i] == Phase.DORMANT:
                     recovered.append(int(self.ids[i]))
-            self.state, _ = model.world.correct(
+            state, _ = model.world.correct(
                 predicted, measured, appearance[None], observed, dt, warp_boxes(self.state.box, motion)
             )
-            self.memory = memory
+            self.state = damp_missing(state, observed, dt, c.dormant_velocity_decay)
+            self.memory, self.votes = memory, votes
+            was_confirmed = self.agents.hits >= c.al_confirm_hits
             self.agents = agents.observe(
                 observed[0],
                 measured_confidence,
@@ -140,25 +198,43 @@ class LifeTracker:
             )
             end |= self.agents.age > c.al_max_dormant_age
             end |= (self.agents.hits < c.al_confirm_hits) & (self.agents.age > c.al_tentative_age)
-            for i, j in pairs:
-                if self.agents.hits[i] >= c.al_confirm_hits and confidence[j] >= c.conf_threshold:
-                    output.append((int(self.ids[i]), j, boxes[j], float(confidence[j]), int(classes[j])))
+            label = self.classes
+            for i, j, _ in pairs:
+                row = (int(self.ids[i]), j, boxes[j], float(confidence[j]), int(label[i]))
+                if self.agents.hits[i] < c.al_confirm_hits:
+                    self.pending[i].append((frame_id, *row[1:]))
+                    continue
+                if confidence[j] < c.conf_threshold and self.agents.phase[i] != Phase.ACTIVE:
+                    continue
+                output.append(row)
+                if not was_confirmed[i] and c.backfill_tentative:
+                    backfill.extend((f, row[0], *rest[1:]) for f, *rest in self.pending[i])
+                self.pending[i] = []
             terminated = self.ids[end].tolist()
             keep = ~end
             self.state = select_objects(self.state, keep)
             self.agents = self.agents.select(keep)
             self.memory, self.anchor = self.memory[keep], self.anchor[keep]
-            self.ids, self.classes = self.ids[keep], self.classes[keep]
-        else:
-            recovered = []
-        births = [j for j in range(m) if j not in matched and confidence[j] >= c.birth_threshold]
+            self.ids, self.votes = self.ids[keep], self.votes[keep]
+            self.pending = [p for p, k in zip(self.pending, keep.tolist()) if k]
+            observed = observed[:, keep]
+        births = [
+            j for j in high.tolist() if j not in matched and confidence[j] >= c.birth_threshold
+        ]
+        if births and observed.any():
+            # A box overlapping a just-matched agent of the same group is a duplicate, not a birth.
+            index = torch.tensor(births, device=boxes.device)
+            owners = observed[0].nonzero().flatten()
+            overlap = pair_iou(boxes[index], self.state.box[0, owners])
+            overlap = overlap.masked_fill(~same_group(classes[index], self.classes[owners], c), 0)
+            births = [j for j, o in zip(births, overlap.max(-1).values.tolist()) if o <= c.birth_suppress_iou]
         if births:
             index = torch.tensor(births, device=boxes.device)
             initial = model.world.initial(boxes, 1, len(index))
             born, _ = model.world.correct(
                 initial,
                 boxes[index][None],
-                features[index][None],
+                center[index][None],
                 torch.ones(1, len(index), dtype=torch.bool, device=boxes.device),
                 dt,
             )
@@ -169,8 +245,6 @@ class LifeTracker:
                 born = select_objects(born, accepted)
                 births = [j for j, yes in zip(births, accepted.tolist()) if yes]
             if births:
-                from dataclasses import fields
-
                 self.state = ObjectState(
                     **{
                         f.name: torch.cat((getattr(self.state, f.name), getattr(born, f.name)), 1)
@@ -185,23 +259,29 @@ class LifeTracker:
                 if c.al_confirm_hits <= 1:
                     agents.phase.fill_(Phase.ACTIVE)
                 self.agents = self.agents.append(agents)
-                self.memory = torch.cat((self.memory, features[index]))
-                self.anchor = torch.cat((self.anchor, features[index]))
+                self.memory = torch.cat((self.memory, center[index]))
+                self.anchor = torch.cat((self.anchor, center[index]))
                 identity = torch.arange(self.next_id, self.next_id + len(index), device=boxes.device)
                 self.next_id += len(index)
                 self.ids = torch.cat((self.ids, identity))
-                self.classes = torch.cat((self.classes, classes[index]))
-                if c.al_confirm_hits <= 1:
-                    output.extend(
-                        (int(i), j, boxes[j], float(confidence[j]), int(classes[j]))
-                        for i, j in zip(identity, births)
-                    )
+                vote = boxes.new_zeros(len(index), c.num_classes)
+                vote[torch.arange(len(index)), classes[index]] = confidence[index]
+                self.votes = torch.cat((self.votes, vote))
+                for i, j in zip(identity.tolist(), births):
+                    row = (int(i), j, boxes[j], float(confidence[j]), int(classes[j]))
+                    if c.al_confirm_hits <= 1:
+                        output.append(row)
+                        self.pending.append([])
+                    else:
+                        self.pending.append([(frame_id, *row[1:])])
         self.previous_frame, self.previous_camera = frame_id, camera
+        self.last_backfill = backfill
         self.last_diagnostics = dict(
             agents=len(self.ids),
             dormant=int((self.agents.phase == Phase.DORMANT).sum()),
             recovered_ids=recovered,
             terminated_ids=terminated,
+            backfilled=len(backfill),
             compute_tokens=budget.spent,
             forecast_agent_steps=budget.forecast_steps,
             roi_rechecks=budget.roi_rechecks,
@@ -237,11 +317,13 @@ class LifeTracker:
         """Vectorized agent/detection/action scoring; no CNN or physical rerollout per action."""
         model, c = self.model, self.config
         n, m = scores.shape
+        margin = statistics[:, 9] * 5
         null = scores.new_full((n,), c.match_threshold)
         if ready:
             phase = policies["lifecycle"].log_softmax(-1)
             null = null + 0.3 * (phase[:, 1] - phase[:, 0]).clamp(-3, 3)
         if critic_ready:
+            # Same wait context as training: anchor, age, margin and forecast affinity.
             wait_pair = model.association.context(
                 predicted.h[0],
                 self.memory,
@@ -251,11 +333,11 @@ class LifeTracker:
                 predicted.box[0],
                 null.new_zeros(n),
                 agents.age,
-                statistics[:, 9] * 5,
+                margin,
             )
             wait_base = model.al.context(wait_pair, statistics, summary)
-            wait_affinity = null.new_zeros(n, 2)
-            wait_affinity[:, 1] = summary[:, 0]
+            identity = torch.arange(n, device=scores.device)
+            wait_affinity = cache.affinities(self.memory, self.memory, null.new_zeros(n), identity)
             effect = model.al.effects(model.al.action_context(wait_base, null.new_zeros(n), wait_affinity, 1))
             null = null - c.al_risk_weight * (effect[:, 0] + c.effect_margin * effect[:, 2])
         if not m:
@@ -271,7 +353,7 @@ class LifeTracker:
             boxes[None].expand(n, -1, -1),
             confidence[None].expand(n, -1),
             agents.age[:, None].expand(-1, m),
-            statistics[:, 9, None].expand(-1, m) * 5,
+            margin[:, None].expand(-1, m),
         )
         prior = model.association.gate(pair)
         base = model.al.context(
@@ -287,7 +369,10 @@ class LifeTracker:
             if ready:
                 utility = utility + 0.3 * torch.nn.functional.logsigmoid(quality)
                 utility = utility.masked_fill(quality.sigmoid() < c.al_match_probability, -torch.inf)
-                utility = utility + c.al_forecast_weight * affinity[..., 0] * affinity[..., 1]
+                # Row-centered: forecast evidence ranks detections for one agent, but does not
+                # make planned agents systematically more eager than unplanned ones.
+                bonus = affinity[..., 0] * affinity[..., 1]
+                utility = utility + c.al_forecast_weight * (bonus - bonus.mean(-1, keepdim=True))
             if critic_ready:
                 effect = model.al.effects(model.al.action_context(base, gate, affinity))
                 utility = utility - c.al_risk_weight * (effect[..., 0] + c.effect_margin * effect[..., 2])

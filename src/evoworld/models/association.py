@@ -28,12 +28,19 @@ def assign(scores: Tensor, threshold: float, forbidden: tuple[int, int] | None =
     return [(int(i), int(j)) for i, j in zip(rows, cols) if j < m and values[i, j] > threshold]
 
 
+SCORE_WEIGHTS = (2.0, 0.5, 1.5, 0.3, 0.1, 0.2)  # cosine, anchor, IoU, offset, innovation, visibility
+
+
 class Association(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.pair = mlp(config.hidden_dim + 6, config.hidden_dim, 1)
+        self.config = config
+        # Pair features: cosine, anchor cosine, relative offset(2), log size(2), confidence.
+        self.pair = mlp(config.hidden_dim + 7, config.hidden_dim, 1)
         self.write = mlp(config.hidden_dim + 8, config.hidden_dim, 1)
         self.effect = mlp(config.hidden_dim + 8, config.hidden_dim, 3)
+        # Hand-set evidence weights become learnable scalars initialized at the old values.
+        self.score_weights = nn.Parameter(torch.tensor(SCORE_WEIGHTS))
         self.horizon = config.probe_horizon
         nn.init.zeros_(self.pair[-1].weight)
         nn.init.zeros_(self.pair[-1].bias)
@@ -41,36 +48,69 @@ class Association(nn.Module):
         nn.init.constant_(self.write[-1].bias, -2.0)
         self.register_buffer("effect_examples", torch.tensor(0, dtype=torch.long))
 
-    def scores(self, state, memory, anchor, boxes, features, classes, detection_classes, forecast=None):
+    def scores(
+        self,
+        state,
+        memory,
+        anchor,
+        boxes,
+        features,
+        classes,
+        detection_classes,
+        forecast=None,
+        confidence=None,
+    ):
+        """Pair scores; -inf marks impossible pairs (class group or position gate)."""
+        from evoworld.classes import class_compatibility
+
         n, m = memory.shape[0], features.shape[0]
         if n == 0 or m == 0:
             return memory.new_empty(n, m)
+        w = self.score_weights.float()
         cosine = memory @ features.T
         anchor_cosine = anchor @ features.T
         diff = boxes[None] - state.box[0, :, None]
-        scale = state.box[0, :, None, 2:].clamp_min(0.02)
+        size = state.box[0, :, None, 2:].clamp_min(1e-4)
+        scale = size.clamp_min(0.02)
         if forecast is not None and "search_variance" in forecast:
             scale = torch.maximum(scale, 2 * forecast["search_variance"][:, None].sqrt())
         relative = diff[..., :2] / scale
-        log_size = (boxes[None, :, 2:].clamp_min(1e-4) / state.box[0, :, None, 2:].clamp_min(1e-4)).log()
+        log_size = (boxes[None, :, 2:].clamp_min(1e-4) / size).log()
         iou = pair_iou(state.box[0], boxes)
-        pair_input = torch.cat((cosine[..., None], anchor_cosine[..., None], relative, log_size), -1)
+        if confidence is None:
+            confidence = features.new_ones(m)
+        pair_input = torch.cat(
+            (
+                cosine[..., None],
+                anchor_cosine[..., None],
+                relative,
+                log_size,
+                confidence.to(cosine)[None, :, None].expand(n, -1, -1),
+            ),
+            -1,
+        )
         h = state.h[0, :, None].expand(-1, m, -1)
         learned = self.pair(torch.cat((h, pair_input), -1)).squeeze(-1)
+        distance = relative.square().sum(-1)
         score = (
-            2 * cosine
-            + 0.5 * anchor_cosine
-            + 1.5 * iou
-            - 0.3 * relative.square().sum(-1).clamp_max(50)
+            w[0] * cosine
+            + w[1] * anchor_cosine
+            + w[2] * iou
+            - w[3] * distance.clamp_max(50)
             + learned
         )
         if forecast is not None:
-            sigma = forecast["log_sigma"][0, :, None, :2].exp().clamp_min(0.005)
+            # Noise floor scales with object size: large boxes jitter more in absolute terms.
+            floor = (0.25 * size[..., :2]).clamp_min(0.004)
+            sigma = torch.maximum(forecast["log_sigma"][0, :, None, :2].exp(), floor)
             innovation = (boxes[None, :, :2] - state.box[0, :, None, :2]) / sigma
-            score = score - 0.1 * innovation.square().sum(-1).clamp_max(50)
-            score = score + 0.2 * F.logsigmoid(forecast["visibility"][0])[:, None]
-        mask = classes[:, None] == detection_classes[None]
-        return score.masked_fill(~mask, -torch.inf)
+            score = score - w[4] * innovation.square().sum(-1).clamp_max(50)
+            score = score + w[5] * F.logsigmoid(forecast["visibility"][0])[:, None]
+        allowed, penalty = class_compatibility(classes, detection_classes, self.config)
+        score = score - penalty.to(score)
+        if self.config.position_gate > 0:
+            allowed = allowed & (distance.detach() <= self.config.position_gate**2)
+        return score.masked_fill(~allowed, -torch.inf)
 
     def context(
         self, h, memory, anchor, measurement, predicted_box, measured_box, confidence, age, margin, gate=None

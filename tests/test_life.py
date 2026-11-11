@@ -217,6 +217,7 @@ def test_actor_gradient_does_not_update_its_critic(config, batch):
         samples,
         AgentState.initial(boxes, 2),
         feature[0],
+        feature[0],
         batch["classes"][0],
         identity_affine(boxes, 1),
         observations,

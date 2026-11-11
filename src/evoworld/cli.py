@@ -16,6 +16,20 @@ def main():
     training.add_argument("--batch-size", type=int, help="Clips per GPU/process")
     training.add_argument("--grad-accumulation", type=int)
     training.add_argument("--workers", type=int, help="DataLoader workers per GPU/process")
+    training.add_argument("--lr-scheduler", choices=("constant", "cosine"), help="Schedule after warmup")
+    training.add_argument("--min-lr-ratio", type=float, help="Final cosine LR as a fraction of each base LR")
+    for option in (
+        "learning-rate",
+        "perception-lr",
+        "reid-lr",
+        "association-lr",
+        "world-lr",
+        "camera-lr",
+        "al-lr",
+    ):
+        training.add_argument(
+            f"--{option}", type=float, help="Override the corresponding config learning rate"
+        )
     training.add_argument("--max-steps", type=int, help="Stop after this total number of optimizer updates")
     training.add_argument(
         "--validate-after-steps",
@@ -111,7 +125,20 @@ def main():
                 parser.error("--val-max-frames requires --validate-after-steps")
             if args.validate_after_steps is not None and args.max_steps is not None:
                 parser.error("Choose --validate-after-steps or --max-steps")
-            for option in ("batch_size", "grad_accumulation", "workers"):
+            for option in (
+                "batch_size",
+                "grad_accumulation",
+                "workers",
+                "learning_rate",
+                "perception_lr",
+                "reid_lr",
+                "association_lr",
+                "world_lr",
+                "camera_lr",
+                "al_lr",
+                "lr_scheduler",
+                "min_lr_ratio",
+            ):
                 value = getattr(args, option)
                 if value is not None:
                     setattr(config, option, value)

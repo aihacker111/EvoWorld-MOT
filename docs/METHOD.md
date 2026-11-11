@@ -1,4 +1,4 @@
-# Per-track Life Agents: implemented v0.2 contract
+# Per-track Life Agents: implemented v0.3 contract
 
 This is a research implementation, not a claim of certified stability, a universal definition of artificial life, or confirmed paper novelty. Historical whole-scene hypothesis ecology is preserved in `METHOD_V1.md` and `legacy_tracking.py`.
 
@@ -50,3 +50,13 @@ The AL critic regresses replay cost/uncertainty and finite-time memory divergenc
 Before claiming benefit, measure identity recovery after occlusion/corruption, premature termination, ghost track duration, duplicate ownership, acquisition tokens, latency/VRAM, IDF1/HOTA/AssA/DetA and detector accuracy on held-out sequences. Compare matching training budgets and report multiple seeds. Ablate learned lifecycle, memory repair, acquisition and imagination independently, controlling inference as well as loss terms.
 
 Limitations: protected anchors can themselves be poor, false-positive proposal sequence replay is incomplete, motion modes use mean-acceleration recurrent rollouts, termination is guarded supervised classification rather than differentiable life/death exploration, and future selected-agent simulation omits unselected future neighbors. No open-ended genetic evolution, biological metabolism, 3D physical simulation, formal safety certificate or proven AL emergence is asserted.
+
+## v0.3 train/inference alignment
+
+The tracker is trained on the candidate distribution it meets in deployment. Each frame's association softmax contains slot measurements (GT-jitter or matched detector proposals carrying the detector's class and confidence) plus up to `max_distractors` detector proposals that localize no visible object. Near-duplicates (IoU ≥ `proposal_iou` with a visible object) are excluded as neither right nor wrong. Free-running assignment can attach an agent to a distractor, which then corrupts its memory and state exactly as at inference. Confident distractors are linked by IoU into false tracks with negative existence/lifecycle/birth labels; ghosts are real false positives or background boxes drawn from the clip's object-size distribution.
+
+Shared rules are single functions called by both training and the deployed tracker: confusable class groups (forbidden across groups, soft penalty inside), a hard position gate in units of the search scale, size-bounded missing uncertainty, per-frame velocity decay of unobserved agents, and group-agnostic NMS of proposals. Agent count statistics are saturating, and training adds random prior history at slot birth so that long-lived deployed agents stay in the trained input range. Critic contexts use the real anchor, age and ambiguity margin; replay continuation can follow the AL quality/null/gate policy (`on_policy_replay`; planning and critic are not rolled out inside replay).
+
+Inference associates in two stages: confident detections by the learned utility, then IoU-only recovery of low-confidence boxes by agents seen within `low_conf_max_age` frames, without appearance writes. ROI pooling refines scores only. Births are suppressed when they duplicate a just-matched agent of the same group. Tentative observations are released (backfilled) at confirmation.
+
+Remaining approximations: distractors are not replayed inside intervention probes; truncated BPTT across clips is not implemented (clips of 16 frames with stride ≤ 2 and bursts ≤ 10 bound the trained gap length); class groups are a fixed prior, not learned.

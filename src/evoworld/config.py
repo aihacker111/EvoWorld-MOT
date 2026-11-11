@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 import hashlib
 import json
+import math
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +50,11 @@ class Config:
     epochs: int = 40
     learning_rate: float = 0.0001
     perception_lr: float = 0.000005
+    reid_lr: float | None = None
+    association_lr: float | None = None
+    world_lr: float | None = None
+    camera_lr: float | None = None
+    al_lr: float | None = None
     weight_decay: float = 0.0001
     grad_accumulation: int = 4
     grad_clip: float = 5.0
@@ -61,6 +67,8 @@ class Config:
     teacher_forcing_start: float = 1.0
     teacher_forcing_end: float = 0.2
     warmup_epochs: int = 3
+    lr_scheduler: str = "constant"
+    min_lr_ratio: float = 0.05
     reid_weight: float = 0.5
     association_weight: float = 1.0
     world_weight: float = 1.0
@@ -110,8 +118,46 @@ class Config:
     al_burst_probability: float = 0.3
     al_burst_length: int = 3
     al_memory_corruption: float = 0.15
+    # --- v0.3: shared train/inference contracts -------------------------------------------
+    # Model class indices (0-based) that a detector confuses; empty list keeps strict classes.
+    # Default: VisDrone {pedestrian, people}, {car, van, truck, bus}, {bicycle, tricycle,
+    # awning-tricycle, motor}.
+    class_groups: list[list[int]] = field(
+        default_factory=lambda: [[0, 1], [3, 4, 5, 8], [2, 6, 7, 9]]
+    )
+    class_mismatch_penalty: float = 1.0
+    group_nms_iou: float = 0.7
+    position_gate: float = 6.0
+    dormant_velocity_decay: float = 0.95
+    dormant_std_cap: float = 1.5
+    # Training distribution: detector false positives, longer gaps, statistics coverage.
+    fp_distractors: bool = True
+    max_distractors: int = 64
+    fp_tracks: bool = True
+    max_fp_tracks: int = 8
+    ghost_per_frame: int = 4
+    proposal_probability_end: float | None = None
+    al_burst_count: int = 1
+    frame_stride_choices: list[int] = field(default_factory=list)
+    perception_grad_every: int = 1
+    rollout_decay: float = 1.0
+    random_agent_history: float = 0.0
+    legacy_effect_in_al: bool = True
+    on_policy_replay: bool = False
+    no_decay_norm_bias: bool = False
+    # Inference.
+    low_conf_max_age: int = 2
+    low_conf_iou: float = 0.3
+    birth_suppress_iou: float = 0.7
+    backfill_tentative: bool = False
+    al_inference_policy: str = "auto"
+    al_inference_critic: str = "auto"
 
     def validate(self) -> "Config":
+        if self.lr_scheduler not in ("constant", "cosine"):
+            raise ValueError("lr_scheduler must be constant or cosine")
+        if not math.isfinite(self.min_lr_ratio) or not 0 <= self.min_lr_ratio <= 1:
+            raise ValueError("min_lr_ratio must be finite and in [0,1]")
         if self.tracker_mode not in ("al", "legacy"):
             raise ValueError("tracker_mode must be al or legacy")
         if self.backend not in ("falcon", "tiny"):
@@ -181,8 +227,12 @@ class Config:
         if self.workers < 0 or self.box_noise < 0 or self.effect_min_examples < 1:
             raise ValueError("Invalid workers, box noise, or effect readiness threshold")
         for key in ("learning_rate", "perception_lr", "grad_clip", "likelihood_temperature"):
-            if getattr(self, key) <= 0:
+            if not math.isfinite(getattr(self, key)) or getattr(self, key) <= 0:
                 raise ValueError(f"{key} must be positive")
+        for key in ("reid_lr", "association_lr", "world_lr", "camera_lr", "al_lr"):
+            value = getattr(self, key)
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{key} must be finite and positive, or null to use learning_rate")
         for key in (
             "weight_decay",
             "reid_weight",
@@ -209,7 +259,52 @@ class Config:
             raise ValueError("Invalid per-agent compute credits")
         if min(self.al_weight, self.al_acquisition_cost, self.al_risk_weight, self.al_forecast_weight) < 0:
             raise ValueError("AL weights and costs must be nonnegative")
+        seen = set()
+        for group in self.class_groups:
+            for index in group:
+                if not 0 <= int(index) < self.num_classes or index in seen:
+                    raise ValueError("class_groups must hold distinct model class indices")
+                seen.add(index)
+        for key in (
+            "group_nms_iou",
+            "low_conf_iou",
+            "birth_suppress_iou",
+            "dormant_velocity_decay",
+            "random_agent_history",
+        ):
+            if not 0 <= getattr(self, key) <= 1:
+                raise ValueError(f"{key} must be in [0,1]")
+        if self.proposal_probability_end is not None and not 0 <= self.proposal_probability_end <= 1:
+            raise ValueError("proposal_probability_end must be in [0,1] or null")
+        if not 0 < self.rollout_decay <= 1:
+            raise ValueError("rollout_decay must be in (0,1]")
+        for key in (
+            "class_mismatch_penalty",
+            "position_gate",
+            "dormant_std_cap",
+            "max_distractors",
+            "max_fp_tracks",
+            "ghost_per_frame",
+            "low_conf_max_age",
+        ):
+            if getattr(self, key) < 0:
+                raise ValueError(f"{key} must be nonnegative")
+        if self.al_burst_count < 1 or self.perception_grad_every < 1:
+            raise ValueError("al_burst_count and perception_grad_every must be positive")
+        if any(int(s) < 1 for s in self.frame_stride_choices):
+            raise ValueError("frame_stride_choices must be positive")
+        for key in ("al_inference_policy", "al_inference_critic"):
+            if getattr(self, key) not in ("auto", "on", "off"):
+                raise ValueError(f"{key} must be auto, on or off")
         return self
+
+    def class_group_table(self) -> list[int]:
+        """Group id for every model class; ungrouped classes form singleton groups."""
+        table = list(range(len(self.class_groups), len(self.class_groups) + self.num_classes))
+        for g, group in enumerate(self.class_groups):
+            for index in group:
+                table[int(index)] = g
+        return table
 
     def dictionary(self) -> dict:
         return asdict(self)

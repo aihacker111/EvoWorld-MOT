@@ -188,6 +188,14 @@ def test_two_process_train_to_real_falcon_validation(config, tmp_path):
         teacher_forcing_end=0.0,
         device="cpu",
         threads=1,
+        perception_lr=5e-5,
+        reid_lr=3e-4,
+        association_lr=2e-4,
+        world_lr=1e-4,
+        camera_lr=1e-4,
+        al_lr=1e-4,
+        lr_scheduler="cosine",
+        min_lr_ratio=0.05,
     )
     config_path = tmp_path / "ddp.yaml"
     config_path.write_text(yaml.safe_dump(config.dictionary()))
@@ -222,6 +230,7 @@ def test_two_process_train_to_real_falcon_validation(config, tmp_path):
     output = Path(config.out)
     checkpoint = torch.load(output / "last.pt", weights_only=False)
     assert checkpoint["distributed"]["world_size"] == 2
+    assert len(checkpoint["optimizer"]["param_groups"]) == 6
     assert checkpoint["progress"]["updates"] == 1 and checkpoint["progress"]["offset"] == 4
     result = json.loads((output / "validation_smoke.json").read_text())
     assert result["frames"] == 3 and result["smoke_test"] is True

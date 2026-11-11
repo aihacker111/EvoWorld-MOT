@@ -95,6 +95,15 @@ def test_two_process_synchronization_and_exact_resume(config, tmp_path):
         workers=1,
         clip_step=2,
         probe_every=2,
+        perception_lr=5e-5,
+        reid_lr=3e-4,
+        association_lr=2e-4,
+        world_lr=1e-4,
+        camera_lr=1e-4,
+        al_lr=1e-4,
+        lr_scheduler="cosine",
+        min_lr_ratio=0.05,
+        warmup_epochs=1,
         train_annotations=str(annotation),
         train_images=str(images),
     )
@@ -153,3 +162,5 @@ def test_two_process_synchronization_and_exact_resume(config, tmp_path):
         torch.testing.assert_close(tensor, resumed["model"][name], rtol=0, atol=0, msg=name)
     assert continuous["distributed"]["samples_per_epoch"] == 6
     assert continuous["distributed"]["dropped_clips"] == 1
+    assert len(continuous["optimizer"]["param_groups"]) == 6
+    assert continuous["optimizer"]["param_groups"][0]["lr"] == pytest.approx(5e-5 * 0.525)

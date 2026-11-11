@@ -120,17 +120,22 @@ class VideoClips(Dataset):
             config,
         )
         self.windows = []
-        span = (config.clip_length - 1) * config.frame_stride + 1
-        for seq, frames in sorted(self.video.sequences.items()):
-            starts = list(range(0, len(frames) - span + 1, config.clip_step))
-            if len(frames) >= span and (not starts or starts[-1] != len(frames) - span):
-                starts.append(len(frames) - span)
-            for start in starts:
-                selected = frames[start : start + span : config.frame_stride]
-                gaps = np.diff([f["frame_id"] for f in selected])
-                if (gaps <= 0).any() or (gaps > config.max_frame_gap).any():
-                    continue
-                self.windows.append((seq, selected))
+        # Several strides expose the temporal model to longer real gaps (dt > 1) between
+        # observations; larger strides use a proportionally larger step between windows.
+        strides = sorted({int(s) for s in config.frame_stride_choices}) or [config.frame_stride]
+        for stride in strides:
+            span = (config.clip_length - 1) * stride + 1
+            step = config.clip_step * max(1, stride // config.frame_stride)
+            for seq, frames in sorted(self.video.sequences.items()):
+                starts = list(range(0, len(frames) - span + 1, step))
+                if len(frames) >= span and (not starts or starts[-1] != len(frames) - span):
+                    starts.append(len(frames) - span)
+                for start in starts:
+                    selected = frames[start : start + span : stride]
+                    gaps = np.diff([f["frame_id"] for f in selected])
+                    if (gaps <= 0).any() or (gaps > config.max_frame_gap).any():
+                        continue
+                    self.windows.append((seq, selected))
         if not self.windows:
             raise ValueError("No valid contiguous clips; check clip_length/frame metadata/gaps")
 

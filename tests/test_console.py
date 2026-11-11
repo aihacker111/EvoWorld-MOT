@@ -73,6 +73,30 @@ def test_compact_table_and_raw_metrics_remain_untouched(tmp_path, monkeypatch):
     assert path.read_text() == raw
 
 
+def test_module_learning_rates_are_compact_and_use_actual_warmup_values(tmp_path, monkeypatch):
+    renderer, output = console(tmp_path, monkeypatch)
+    renderer.consume(
+        json.dumps(
+            dict(
+                event="learning_rates",
+                epoch=1,
+                lrs={
+                    "detector": 5e-5 / 3,
+                    "reid": 3e-4 / 3,
+                    "world": 1e-4 / 3,
+                    "camera": 1e-4 / 3,
+                    "association": 2e-4 / 3,
+                    "al": 1e-4 / 3,
+                },
+            )
+        )
+        + "\n"
+    )
+    rows = [line for line in output.getvalue().splitlines() if line.startswith("LR epoch")]
+    assert len(rows) == 2 and all(len(row) <= 100 for row in rows)
+    assert "detector 1.67e-05" in rows[0] and "reid 1.00e-04" in rows[0]
+
+
 def test_validation_events_are_readable_and_clear_training_eta(tmp_path, monkeypatch):
     renderer, output = console(tmp_path, monkeypatch)
     renderer.consume(json.dumps(record(1)) + "\n")
@@ -228,7 +252,8 @@ def test_pretty_launcher_trains_and_resumes_without_source_changes(tmp_path):
     assert '"detector":' not in completed.stdout
     log = Path(config.out) / "metrics.jsonl"
     records = [json.loads(line) for line in log.read_text().splitlines()]
-    assert len(records) == 2 and records[-1]["updates"] == 2 and "al_memory" in records[-1]
+    updates = [row for row in records if "loss" in row]
+    assert len(updates) == 2 and updates[-1]["updates"] == 2 and "al_memory" in updates[-1]
     checkpoint = Path(config.out) / "last.pt"
     resumed = subprocess.run(
         [

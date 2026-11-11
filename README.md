@@ -1,8 +1,54 @@
-# EvoWorld-MOT 0.2 — Per-track Artificial Life
+# EvoWorld-MOT 0.3 — Per-track Artificial Life
 
 UAV multi-object tracking với **Falcon detector + object-centric world model + cá thể tracking có vòng đời và chính sách tự duy trì identity**. Bản 0.2 đưa AL vào cả training và inference; mỗi ID có memory, belief tồn tại, uncertainty, trạng thái tentative/active/dormant và tín dụng tính toán riêng.
 
 Đây là implementation nghiên cứu có thể train. Chưa có checkpoint hội tụ trên dataset thực, benchmark GPU hoặc bằng chứng novelty/SOTA. Việc gọi cơ chế này là AL mô tả thiết kế cá thể thích nghi và tự duy trì, không phải một chứng nhận mô phỏng sự sống sinh học.
+
+## 0.3 — Đồng bộ train và inference
+
+Bản 0.2 train tracker trong một "thế giới sạch": mỗi cột association là một GT, không có false positive (FP), class detection luôn đúng GT và track chỉ mất quan sát vài frame. Inference lại gặp tới 300 detection có FP, class bị nhầm và occlusion dài. Bản 0.3 cho training thấy đúng phân phối đó. Các quy tắc tracker dùng chung một hàm ở cả hai phía.
+
+| Vấn đề ở 0.2 | Thay đổi ở 0.3 | Config |
+|---|---|---|
+| Association không thấy FP | Proposal không khớp GT trở thành cột distractor trong cross-entropy; Hungarian khi không teacher-forcing có thể trôi sang FP | `fp_distractors`, `max_distractors` |
+| Lifecycle không thấy track rác | FP tin cậy được nối qua frame thành track riêng: nhãn existence âm, lifecycle terminate | `fp_tracks`, `max_fp_tracks` |
+| Ghost cố định 0.08×0.12 (đường tắt theo kích thước) | Mẫu âm lấy từ FP thật, box ngẫu nhiên theo phân phối kích thước GT | `ghost_per_frame` |
+| Track–FP không có nhãn âm | Cặp track với FP khó nhất: quality = 0, write gate = 0 | (luôn bật khi có distractor) |
+| Class khóa cứng; car/van nhầm thì mất ID | Nhóm class: khác nhóm thì cấm, cùng nhóm khác class thì phạt mềm; track bỏ phiếu class; training dùng class do detector dự đoán | `class_groups`, `class_mismatch_penalty` |
+| Hai box car và van trên cùng vật thành 2 ID | NMS theo nhóm cho cả proposal train và inference; chặn birth trùng với track vừa match | `group_nms_iou`, `birth_suppress_iou` |
+| Dormant 90 frame, vùng tìm kiếm phình ra cả ảnh | Cap std theo kích thước box, damping velocity khi mất quan sát, gate vị trí cứng, dormant 45 | `dormant_std_cap`, `dormant_velocity_decay`, `position_gate`, `al_max_dormant_age` |
+| Chỉ train trên gap ≤ 5 frame | Clip 16, stride {1, 2}, nhiều burst dài tới 10 frame | `clip_length`, `frame_stride_choices`, `al_burst_*` |
+| Statistics age/hits/lifetime ngoài dải lúc train | Đặc trưng bão hòa `1-exp(-x/τ)`, lịch sử ngẫu nhiên khi một slot được sinh | `random_agent_history` |
+| Context critic lúc train khác inference | Context dựng lại với anchor, age, margin thật; wait affinity tính giống nhau | (luôn bật) |
+| Replay tiếp tục bằng `assign` + write 0.15 | Replay on-policy: quality, null và gate của AL | `on_policy_replay` |
+| Ba objective cùng kéo write gate | Tắt effect/stability và target gate 0.2 của v1 trong AL | `legacy_effect_in_al: false` |
+| Confidence không có trong score; low-conf cướp track | Confidence là input của pair; association 2 tầng: conf cao dùng utility AL, conf thấp chỉ cho track vừa thấy bằng IoU, không ghi memory | `low_conf_max_age`, `low_conf_iou` |
+| ROI ghi đè feature vào memory | ROI chỉ dùng để chấm điểm; memory/world/birth luôn dùng center feature như lúc train | (luôn bật) |
+| Bonus forecast thiên vị agent được planning | Bonus được căn giữa theo hàng | (luôn bật) |
+| Mất frame đầu của mỗi track | Backfill các frame tentative khi track được xác nhận (evaluator có bộ đệm trễ) | `backfill_tentative` |
+| Hệ số score viết cứng | Scalar học được, khởi tạo bằng giá trị cũ; sigma floor tỉ lệ theo kích thước box | (tham số `association.score_weights`) |
+| Weight decay lên LayerNorm/bias | Nhóm `/no_decay` riêng, cùng LR | `no_decay_norm_bias` |
+| Curriculum proposal dừng ở 0.5 | Tăng tuyến tính tới 0.9 ở epoch cuối | `proposal_probability_end` |
+| Rollout loss trọng số đều | Trọng số giảm dần theo bước, horizon 6 | `rollout_decay`, `horizon` |
+
+`al_inference_policy`/`al_inference_critic` (`auto`, `on`, `off`) bật hoặc tắt policy và critic khi inference để ablation. `auto` giữ quy tắc counter cũ.
+
+**Train lại.** Source, kiến trúc và config đều đã đổi, nên luôn dùng **thư mục run mới**:
+
+```bash
+# Kiểm tra nhanh luồng train → validation
+bash tools/train_2gpu.sh --config configs/full.yaml --out /kaggle/working/runs/al_v3_check \
+  --init-checkpoint /kaggle/working/runs/al_2gpu/last.pt \
+  --validate-after-steps 2 --val-max-frames 100 --log-every 1
+
+# Train đầy đủ (bỏ --init-checkpoint để train mới từ detector Falcon)
+bash tools/train_2gpu.sh --config configs/full.yaml --out /kaggle/working/runs/al_v3 \
+  --init-checkpoint /kaggle/working/runs/al_2gpu/last.pt
+```
+
+Warm-start từ checkpoint v0.2 vẫn hợp lệ: cột confidence mới của pair MLP được zero-init và `score_weights` lấy đúng giá trị cũ, nên association ban đầu giữ nguyên hành vi. Ngoại lệ là statistics bão hòa, khiến đầu vào của AL đổi thang đo; các head AL sẽ thích nghi khi train lại. Checkpoint cũ vẫn chạy được `track`/`evaluate` qua cùng loader.
+
+**Chưa đo:** VRAM/throughput với clip 16 và tới 64 distractor mỗi frame. Nếu OOM trên GPU 16 GB, dùng `configs/compact.yaml` (640×384, clip 12) hoặc giảm `max_distractors`/`max_fp_tracks`. Mọi tham số mới đều là giả thuyết thiết kế; hiệu quả trên VisDrone phải xác nhận bằng validation.
 
 ## 1. Cài đặt và kiểm tra
 
@@ -27,7 +73,7 @@ Ultralytics được pin `8.3.221`; không cần import source Falcon-MOT. Dùng
 | `weights/falcon_detector.pth` | `pretrained_model/falcon_yolo_lqcv2_baseline_det.pth` |
 | `src/evoworld/models/reid.py` | compact ReID head từ Falcon, làm sạch định dạng/import |
 
-Checkpoint detector: epoch 120, 10 class, strict load 493 tensor; SHA256 `5eab076f2b991e82fedd410c7e0381542320cce2b93385fb9c55ddea78708aad`. Class/shape không khớp sẽ bị từ chối. Model full hiện có **8,209,754 tham số**, gồm **76,939 tham số AL mới**.
+Checkpoint detector: epoch 120, 10 class, strict load 493 tensor; SHA256 `5eab076f2b991e82fedd410c7e0381542320cce2b93385fb9c55ddea78708aad`. Class/shape không khớp sẽ bị từ chối. Model full hiện có **8,209,888 tham số**, gồm **76,939 tham số AL**; v0.3 thêm 134 tham số association (cột confidence và 6 trọng số score học được).
 
 ```bash
 # Smoke kiểm tra đường đi code, không đánh giá chất lượng.
@@ -121,9 +167,9 @@ Preprocess mặc định: resize trực tiếp, BGR→RGB, `/255`, ImageNet mean
 bash tools/train.sh --config configs/full.yaml
 ```
 
-Mặc định 960×544, clip 8, burn-in 2, open-loop horizon 4; RSSM hidden128/stochastic16, ReID128, 8 neighbors, 3 motion modes. CNN chạy một lần/frame; các lựa chọn AL dùng chung feature map và physical forecast.
+Mặc định v0.3: 960×544, clip 16 (stride 1 hoặc 2), burn-in 2, open-loop horizon 6, gradient perception mỗi 2 frame; RSSM hidden128/stochastic16, ReID128, 8 neighbors, 3 motion modes. CNN chạy một lần/frame; các lựa chọn AL dùng chung feature map và physical forecast.
 
-Tất cả tham số có thể học cập nhật cùng run: detector LR `5e-6`, ReID/world/association/AL LR `1e-4`; accumulation4, warmup3 epoch, CUDA AMP, gradient clipping5, tổng40 epoch. Detector BN giữ running statistics cho batch nhỏ, convolution/affine vẫn train; DFL projection cố định giữ nguyên. Burn-in không giữ gradient.
+Tất cả tham số có thể học cập nhật cùng run: detector LR `5e-6`, ReID/world/association/AL LR `1e-4`; accumulation4, warmup3 epoch rồi cosine decay trong các config full/compact, CUDA AMP, gradient clipping5, tổng40 epoch. Detector BN giữ running statistics cho batch nhỏ, convolution/affine vẫn train; DFL projection cố định giữ nguyên. Burn-in không giữ gradient.
 
 Curriculum tăng proposal thật tới 50% frame sau warmup; GT-jitter và dropout hỗ trợ giai đoạn đầu. Proposal match với GT theo class/IoU để lấy nhãn, các FP không match chưa được đưa đầy đủ vào sequence replay. AL được bổ sung burst mất quan sát, corruption working memory và negative background candidates. GT/anchor không bị sửa bởi augmentation corruption.
 
@@ -139,6 +185,73 @@ bash tools/train.sh --config configs/compact.yaml --out runs/check_al --resume r
 ```
 
 CPU là mặc định trên Mac; CUDA tự chọn khi có. `--max-steps` là tổng optimizer updates, không phải số update thêm. Số update/epoch = `ceil(ceil(num_clips / batch_size) / grad_accumulation)`.
+
+### Thử learning rate cao hơn cho detector/ReID
+
+`configs/full_fast_lr.yaml` là cấu hình thử riêng, sao chép data/model paths từ `full.yaml`; cấu hình baseline được giữ để đối chiếu. Các LR là giá trị cơ sở của **nhóm tham số**, không phải hệ số của loss:
+
+| Nhóm tham số | Baseline | Fast LR | Epoch 1 (warmup /3) |
+|---|---:|---:|---:|
+| Detector pretrained (`perception_lr`) | 5e-6 | **5e-5** | 1.67e-5 |
+| ReID (`reid_lr`) | 1e-4 | **3e-4** | 1e-4 |
+| Association (`association_lr`) | 1e-4 | **2e-4** | 6.67e-5 |
+| World (`world_lr`) | 1e-4 | 1e-4 | 3.33e-5 |
+| Camera (`camera_lr`) | 1e-4 | 1e-4 | 3.33e-5 |
+| AL (`al_lr`) | 1e-4 | 1e-4 | 3.33e-5 |
+
+Các override module mặc định `null`, tức dùng `learning_rate`. Có override thì optimizer chia nhóm riêng; nếu tất cả là null, giữ cách chia detector/new-module như baseline. Mỗi tham số có một owner; gradient từ nhiều loss vẫn có thể cộng vào cùng tham số. ReID/association/world loss đi qua detector dùng LR detector tại các tham số dùng chung. Trọng số loss được giữ nguyên. PyTorch hỗ trợ cách chia này bằng [per-parameter optimizer options](https://docs.pytorch.org/docs/stable/optim.html#per-parameter-options).
+
+Warmup 3 epoch với hệ số 1/3, 2/3, 1; sau đó LR giảm theo cosine về 5% base LR ở epoch cuối (cập nhật theo epoch, không restart). Log in `LR epoch ...` ở đầu mỗi epoch, `metrics.jsonl` lưu `lrs` thực tế tại mỗi update và `run.json` lưu `optimizer.base_lrs`. Các giá trị mới là giả thuyết tuning, chưa đo hiệu quả trên VisDrone; loss giảm chậm chưa đủ xác định nguyên nhân là LR. World/AL giữ LR cũ để ưu tiên kiểm tra perception. So sánh trung bình Det/ReID, validation IDF1/MOTA/IDSW và AMP skips dưới cùng dữ liệu, batch, seed và khởi tạo weights. Trial 2 update chỉ kiểm tra code/validation, không chứng minh LR tốt.
+
+```bash
+# Thử luồng train/validation trước; cần source mới trên Kaggle.
+bash tools/train_2gpu.sh --config configs/full_fast_lr.yaml \
+  --out /kaggle/working/runs/al_fast_lr_check \
+  --init-checkpoint /kaggle/working/runs/al_2gpu/last.pt \
+  --validate-after-steps 2 --val-max-frames 100 --log-every 1
+
+# Run mới để đánh giá một epoch đầy đủ và tiếp tục 40 epoch theo config.
+bash tools/train_2gpu.sh --config configs/full_fast_lr.yaml \
+  --out /kaggle/working/runs/al_fast_lr \
+  --init-checkpoint /kaggle/working/runs/al_2gpu/last.pt
+```
+
+Trong Kaggle Notebook thêm `!` trước `bash`; dùng `tools/train.sh` cho một GPU. Có thể thay LR trực tiếp bằng `--perception-lr`, `--reid-lr`, `--association-lr`, `--world-lr`, `--camera-lr`, `--al-lr` và fallback `--learning-rate`. Hai GPU không tự nhân LR. Launcher hiện đặt batch2/GPU × accumulation4 × 2GPU = **effective batch16**; các flags batch có thể override, và startup metadata in batch thực tế.
+
+Source/optimizer/config đã đổi nên chuyển weights cũ bằng `--init-checkpoint` vào output mới; giữ weights/counters nhưng reset optimizer/scaler/sampler/tiến độ. `--resume` chỉ dành cho cùng source, rates và cấu hình tối ưu của run mới; sửa YAML rồi resume không phải cách đổi LR cho optimizer đã lưu.
+
+### Warmup rồi cosine decay
+
+`full.yaml`, `full_fast_lr.yaml` và `compact.yaml` bật lịch mới:
+
+```yaml
+warmup_epochs: 3
+lr_scheduler: cosine
+min_lr_ratio: 0.05
+```
+
+Mọi nhóm tham số dùng chung hệ số lịch, giữ nguyên tỷ lệ LR giữa các module. Trong warmup, hệ số bằng `(epoch + 1) / warmup_epochs`, với epoch đánh số từ 0. Sau warmup:
+
+```text
+peak = max(0, warmup_epochs - 1)
+p = clamp((epoch - peak) / max(1, epochs - 1 - peak), 0, 1)
+LR_group = base_LR_group * [min_lr_ratio + (1 - min_lr_ratio) * (1 + cos(pi * p)) / 2]
+```
+
+Đây là closed-form cosine annealing theo [công thức PyTorch](https://docs.pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.CosineAnnealingLR.html), áp dụng minimum riêng bằng tỷ lệ base LR của mỗi nhóm. Lịch cập nhật **ở đầu mỗi epoch**, không theo microbatch/update và không có restart. Epoch warmup cuối đạt base LR; epoch cuối của phần cosine đạt đúng `min_lr_ratio * base_lr`. Nếu run kết thúc trong warmup thì chỉ chạy warmup. Không warmup: epoch đầu bắt đầu ở base LR; run chỉ một epoch dùng base LR.
+
+LR được tính trực tiếp từ epoch và config đã lưu, không có scheduler counter riêng cần đồng bộ. Resume giữa epoch giữ đúng LR và optimizer state; thay `epochs`, scheduler hoặc minimum ratio bị từ chối khi resume để tránh đổi lịch thầm lặng. AMP skips không gọi scheduler thêm. `lr_scheduler: constant` hoặc `--lr-scheduler constant` khôi phục hành vi warmup rồi giữ LR cố định; config cũ thiếu trường mới dùng constant để bảo toàn ý nghĩa cũ.
+
+Ví dụ detector base LR `1e-4`, 40 epoch, warmup3: epoch1 `3.33e-5`, epoch2 `6.67e-5`, epoch3 `1e-4`, epoch40 `5e-6`. ReID base `3e-4` kết thúc ở `1.5e-5`. Lệnh trên Kaggle sau khi cập nhật source:
+
+```bash
+bash tools/train_2gpu.sh --config configs/full_fast_lr.yaml \
+  --perception-lr 1e-4 --lr-scheduler cosine --min-lr-ratio 0.05 \
+  --out /kaggle/working/runs/al_cosine \
+  --init-checkpoint /kaggle/working/runs/al_2gpu/last.pt
+```
+
+Dùng output mới và `--init-checkpoint` khi chuyển từ source/lịch LR cũ; weights/counters giữ nguyên, optimizer/scaler/tiến độ khởi tạo lại. Log startup nêu scheduler/warmup/minimum, log `LR epoch ...` và `metrics.jsonl` ghi LR thực tế. Cosine chưa được đánh giá chất lượng trên VisDrone; cần đối chiếu validation dưới cùng điều kiện.
 
 ### Chạy thử train → validation trước khi train dài
 
@@ -176,7 +289,7 @@ al_min_examples: 256
 al_critic_min_examples: 64
 al_confirm_hits: 2
 al_tentative_age: 3
-al_max_dormant_age: 90
+al_max_dormant_age: 45
 ```
 
 Một token tính một **agent forecast step** hoặc một **additional five-point ROI pool**. Global budget và credit phải đủ trước khi thực hiện. ROI của cùng detection được cache dùng chung. Token là đơn vị thao tác, không phải số millisecond/FLOP cố định. Chi phí CNN cơ sở và association không nằm trong ngân sách AL.

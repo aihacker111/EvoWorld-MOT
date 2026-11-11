@@ -94,6 +94,14 @@ class TrainingConsole:
             return
         if "run" in record and "parameters" in record:
             self.start(record)
+        elif record.get("event") == "learning_rates":
+            if self.mode != "quiet":
+                items = list(record["lrs"].items())
+                for offset in range(0, len(items), 3):
+                    self.write(
+                        f"LR epoch {record['epoch']} | "
+                        + " | ".join(f"{name} {value:.2e}" for name, value in items[offset : offset + 3])
+                    )
         elif record.get("event", "").startswith("validation_"):
             if self.mode != "quiet":
                 self.validation(record)
@@ -156,6 +164,13 @@ class TrainingConsole:
             f"batch {effective if effective is not None else '?'} | {self.samples:,} clips/epoch"
         )
         self.write(f"Run: {self.run}")
+        scheduler = record.get("optimizer", metadata.get("optimizer", {}))
+        if scheduler:
+            kind = scheduler.get("lr_scheduler", "constant")
+            text = f"LR schedule: {kind} | warmup {scheduler.get('warmup_epochs', '?')} epochs"
+            if kind == "cosine":
+                text += f" | final {scheduler.get('min_lr_ratio', 0.05):.1%} of base LR | no restarts"
+            self.write(text)
         if self.config.get("tracker_mode", "al") == "al":
             self.write(
                 f"AL warmup: policy {self.config.get('al_min_examples', 256):,} | "

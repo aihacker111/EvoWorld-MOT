@@ -73,6 +73,7 @@ def test_supplied_falcon_checkpoint_full_backward_and_decode(config, batch):
     assert detections[0]["boxes"].shape[1] == 4
     config.num_classes = 9
     config.category_ids = list(range(1, 10))
+    config.class_groups = []
     with pytest.raises(ValueError, match="incompatible"):
         EvoWorld(config)
 

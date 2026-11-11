@@ -110,6 +110,15 @@ def track(model, source, out, device="cpu", fps=25.0):
                         color,
                         1,
                     )
+                # Rows of tentative frames released at confirmation (MOT readers group by frame).
+                for past_frame, identity, box, confidence, cls in getattr(tracker, "last_backfill", []):
+                    x, y, w, h = box.cpu().tolist()
+                    x, y, w, h = (x - w / 2) * width, (y - h / 2) * height, w * width, h * height
+                    result.write(
+                        f"{past_frame},{identity},{x:.3f},{y:.3f},{w:.3f},{h:.3f},{confidence:.5f},-1,-1,-1\n"
+                    )
+                    category = model.config.category_ids[cls]
+                    classes_file.write(json.dumps(dict(frame=past_frame, id=identity, category_id=category)) + "\n")
                 writer.write(image)
                 previous, previous_boxes = resized, detections["boxes"].cpu().numpy()
                 count += 1

@@ -116,6 +116,13 @@ def ignore_unmatched(pred_boxes, gt_boxes, gt_classes, pred_classes, ignored, fr
     return keep
 
 
+def backfill_delay(config):
+    """Frames a tentative row can arrive late (0 when backfill is off)."""
+    if config.tracker_mode != "al" or not config.backfill_tentative:
+        return 0
+    return config.al_tentative_age + config.al_confirm_hits
+
+
 @torch.no_grad()
 def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_frames=None, progress=None):
     if max_frames is not None and max_frames < 1:
@@ -148,6 +155,42 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_f
         metrics = IdentityMetrics()
         previous, previous_boxes = None, np.empty((0, 4), np.float32)
         lines, sidecar, sequence_data = [], [], []
+        # Confirmed tentative rows arrive a few frames late; score frames after that delay.
+        delay = backfill_delay(model.config)
+        buffer = {}
+
+        def flush(frame_record):
+            frame, gt_ids, gt_classes, gt_boxes, rows = frame_record
+            pred_boxes = torch.stack([r[2] for r in rows]) if rows else gt_boxes.new_empty(0, 4)
+            pred_classes = torch.tensor([r[4] for r in rows], device=gt_boxes.device, dtype=torch.long)
+            keep = ignore_unmatched(
+                pred_boxes,
+                gt_boxes,
+                torch.tensor(gt_classes, device=gt_boxes.device, dtype=torch.long),
+                pred_classes,
+                ignored[frame["id"]],
+                frame,
+            )
+            selected = [r for r, ok in zip(rows, keep) if ok]
+            pred_boxes, pred_classes = pred_boxes[keep], pred_classes[keep]
+            pred_ids = [r[0] for r in selected]
+            similarity = metrics.update(gt_ids, gt_boxes, gt_classes, pred_ids, pred_boxes, pred_classes.tolist())
+            sequence_data.append((gt_ids, pred_ids, similarity))
+            for identity, _, box, confidence, cls in rows:
+                x, y, w, h = box.cpu().tolist()
+                x, y, w, h = (
+                    (x - w / 2) * frame["width"],
+                    (y - h / 2) * frame["height"],
+                    w * frame["width"],
+                    h * frame["height"],
+                )
+                lines.append(
+                    f"{frame['frame_id']},{identity},{x:.3f},{y:.3f},{w:.3f},{h:.3f},{confidence:.5f},-1,-1,-1\n"
+                )
+                sidecar.append(
+                    dict(frame=frame["frame_id"], id=identity, category_id=model.config.category_ids[cls])
+                )
+
         for frame in frames:
             image, annotations_frame = video.read(frame)
             tensor, resized = prepare_image(image, model.config)
@@ -163,42 +206,19 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_f
             gt = video.boxes(frame, annotations_frame)
             gt_ids, gt_classes = [r[0] for r in gt], [r[1] for r in gt]
             gt_boxes = tensor.new_tensor(np.array([r[2] for r in gt], np.float32).reshape(-1, 4))
-            pred_boxes = torch.stack([r[2] for r in rows]) if rows else tensor.new_empty(0, 4)
-            pred_classes = torch.tensor([r[4] for r in rows], device=device)
-            keep = ignore_unmatched(
-                pred_boxes,
-                gt_boxes,
-                torch.tensor(gt_classes, device=device),
-                pred_classes,
-                ignored[frame["id"]],
-                frame,
-            )
-            selected = [r for r, ok in zip(rows, keep) if ok]
-            pred_boxes, pred_classes = pred_boxes[keep], pred_classes[keep]
-            pred_ids = [r[0] for r in selected]
-            similarity = metrics.update(
-                gt_ids, gt_boxes, gt_classes, pred_ids, pred_boxes, pred_classes.tolist()
-            )
-            sequence_data.append((gt_ids, pred_ids, similarity))
-            for row in rows:
-                identity, _, box, confidence, cls = row
-                x, y, w, h = box.cpu().tolist()
-                x, y, w, h = (
-                    (x - w / 2) * frame["width"],
-                    (y - h / 2) * frame["height"],
-                    w * frame["width"],
-                    h * frame["height"],
-                )
-                lines.append(
-                    f"{frame['frame_id']},{identity},{x:.3f},{y:.3f},{w:.3f},{h:.3f},{confidence:.5f},-1,-1,-1\n"
-                )
-                sidecar.append(
-                    dict(frame=frame["frame_id"], id=identity, category_id=model.config.category_ids[cls])
-                )
+            buffer[frame["frame_id"]] = (frame, gt_ids, gt_classes, gt_boxes, list(rows))
+            for frame_id, identity, box, confidence, cls in getattr(tracker, "last_backfill", []):
+                if frame_id in buffer:
+                    buffer[frame_id][4].append((identity, -1, box, confidence, cls))
+            for frame_id in sorted(buffer):
+                if frame_id <= frame["frame_id"] - delay:
+                    flush(buffer.pop(frame_id))
             previous, previous_boxes = resized, detection["boxes"].cpu().numpy()
             processed += 1
             if processed % 50 == 0:
                 report(seq)
+        for frame_id in sorted(buffer):
+            flush(buffer.pop(frame_id))
         # No path traversal through user-provided sequence names.
         safe_seq = seq.replace("/", "_").replace("\\", "_").replace("..", "_")
         (out / f"{safe_seq}.txt").write_text("".join(lines))

@@ -93,7 +93,7 @@ def load_for_inference(path, device="cpu"):
         configuration["tracker_mode"] = "legacy"
     config = Config(**configuration).validate()
     model = EvoWorld(config, initialize=False)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    checkpoint["compatibility"] = transfer_state(model, checkpoint["model"])
     return model.to(device).eval(), checkpoint
 
 
@@ -105,6 +105,7 @@ def check_resume(checkpoint, config, provenance):
     # Changing these does not change the optimization or sample/augmentation stream.
     mutable = {"out", "epochs", "workers", "device", "validate_every"}
     old = checkpoint["config"]
+    old = Config(**old).dictionary()
     changed = [k for k, v in config.dictionary().items() if k not in mutable and old[k] != v]
     # Epoch count changes the teacher-forcing schedule, hence must remain fixed in practice.
     if old["epochs"] != config.epochs:
@@ -115,25 +116,56 @@ def check_resume(checkpoint, config, provenance):
         )
 
 
+# Parameters introduced after v0.2 that older checkpoints legitimately lack.
+NEW_PARAMETERS = ("association.score_weights",)
+
+
+def transfer_state(model, state):
+    """Load weights from an older architecture without changing its function.
+
+    * identical tensors are copied;
+    * a Linear weight whose input grew by appended features keeps old columns and
+      gets zero new columns (the new inputs start with no effect);
+    * AL weights (v1 checkpoints) and listed new parameters keep their initialization.
+    Anything else is an architecture mismatch.
+    """
+    expected = model.state_dict()
+    unexpected = sorted(set(state) - set(expected))
+    missing = sorted(set(expected) - set(state))
+    allowed = [k for k in missing if k.startswith("al.") or k in NEW_PARAMETERS]
+    expanded, wrong = [], []
+    merged = dict(expected)
+    for key in set(state) & set(expected):
+        old, new = state[key], expected[key]
+        if old.shape == new.shape:
+            merged[key] = old
+        elif old.ndim == 2 and new.ndim == 2 and old.shape[0] == new.shape[0] and old.shape[1] < new.shape[1]:
+            grown = new.new_zeros(new.shape)
+            grown[:, : old.shape[1]] = old
+            merged[key] = grown
+            expanded.append(key)
+        else:
+            wrong.append(key)
+    if unexpected or wrong or len(allowed) != len(missing):
+        raise ValueError(
+            "Warm-start architecture mismatch: "
+            f"unexpected={unexpected[:3]}, missing={[k for k in missing if k not in allowed][:3]}, "
+            f"shape={wrong[:3]}"
+        )
+    model.load_state_dict(merged, strict=True)
+    return dict(newly_initialized=missing, expanded_inputs=sorted(expanded))
+
+
 def initialize_from_checkpoint(model, path):
     """Explicit weight transfer; never pretend old optimizer/RNG states fit a new algorithm."""
     path = Path(path)
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint.get("format_version") not in (1, 2):
         raise ValueError("Expected an EvoWorld v1/v2 checkpoint for --init-checkpoint")
-    state = checkpoint["model"]
-    expected = model.state_dict()
-    unexpected = sorted(set(state) - set(expected))
-    missing = sorted(set(expected) - set(state))
-    wrong = [key for key in set(state) & set(expected) if state[key].shape != expected[key].shape]
-    if unexpected or wrong or any(not key.startswith("al.") for key in missing):
-        raise ValueError(
-            f"Warm-start architecture mismatch: unexpected={unexpected[:3]}, missing={missing[:3]}, shape={wrong[:3]}"
-        )
-    model.load_state_dict(state, strict=not missing)
+    report = transfer_state(model, checkpoint["model"])
     return dict(
         path=str(path),
         sha256=sha256(path),
         format_version=checkpoint["format_version"],
-        newly_initialized=missing,
+        **report,
     )

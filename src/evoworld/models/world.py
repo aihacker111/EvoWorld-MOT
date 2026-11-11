@@ -37,6 +37,20 @@ class ObjectState:
         return ObjectState(**{f.name: getattr(self, f.name)[index] for f in fields(self)})
 
 
+def damp_missing(state: ObjectState, observed: Tensor, delta: Tensor, decay: float) -> ObjectState:
+    """Shared tracker rule (training and inference): unobserved velocity decays per frame.
+
+    Open-loop constant velocity over long occlusions drifts predictions out of the scene.
+    """
+    if decay >= 1:
+        return state
+    factor = torch.as_tensor(decay, dtype=state.velocity.dtype, device=state.velocity.device)
+    factor = factor ** delta.to(state.velocity).reshape(-1, 1, 1)
+    missing = (state.valid & ~observed)[..., None]
+    velocity = torch.where(missing, state.velocity * factor, state.velocity)
+    return ObjectState(state.h, state.z, state.box, velocity, state.valid)
+
+
 class NeighborInteraction(nn.Module):
     def __init__(self, hidden: int, neighbors: int):
         super().__init__()

@@ -13,6 +13,7 @@ from evoworld.data import VideoClips, ClipSampler, DistributedClipSampler, colla
 from evoworld.distributed import DistributedContext
 from evoworld.models.system import EvoWorld
 from evoworld.objective import training_objective
+from evoworld.optimization import build_optimizer, learning_rates, set_epoch_learning_rates
 from evoworld.runtime import (
     setup,
     environment,
@@ -100,18 +101,7 @@ def _train(
     model = EvoWorld(config, initialize=not bool(resume or init_checkpoint)).to(device).train()
     if init_checkpoint:
         provenance["warmstart"] = initialize_from_checkpoint(model, resolve(str(init_checkpoint)))
-    perception = list(model.perception.parameters())
-    perception_ids = {id(p) for p in perception}
-    reid_ids = {id(p) for p in model.perception.reid.parameters()}
-    pretrained = [p for p in perception if id(p) not in reid_ids]
-    new = [p for p in model.parameters() if id(p) not in perception_ids or id(p) in reid_ids]
-    optimizer = torch.optim.AdamW(
-        [
-            dict(params=pretrained, lr=config.perception_lr, base_lr=config.perception_lr),
-            dict(params=new, lr=config.learning_rate, base_lr=config.learning_rate),
-        ],
-        weight_decay=config.weight_decay,
-    )
+    optimizer = build_optimizer(model, config)
     scaler = torch.amp.GradScaler("cuda", enabled=config.amp and device.type == "cuda")
     progress = dict(epoch=0, offset=0, updates=0, micro_steps=0, best_idf1=-1.0)
     restored_rng = None
@@ -127,6 +117,10 @@ def _train(
         check_resume(checkpoint, config, provenance)
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
+        # Checkpoints from before named groups used the same original two-group layout.
+        if len(optimizer.param_groups) == 2:
+            for group, name in zip(optimizer.param_groups, ("detector", "new")):
+                group.setdefault("name", name)
         scaler.load_state_dict(checkpoint["scaler"])
         progress.update(checkpoint["progress"])
         restored_rng = saved["rng_by_rank"][context.rank] if "rng_by_rank" in saved else checkpoint["rng"]
@@ -158,6 +152,13 @@ def _train(
         detector_load=model.perception.load_report,
         device=str(device),
         distributed=distributed,
+        optimizer=dict(
+            name="AdamW",
+            base_lrs={group["name"]: group["base_lr"] for group in optimizer.param_groups},
+            warmup_epochs=config.warmup_epochs,
+            lr_scheduler=config.lr_scheduler,
+            min_lr_ratio=config.min_lr_ratio,
+        ),
     )
 
     def publish_run():
@@ -172,6 +173,7 @@ def _train(
                     **distributed,
                     per_gpu_batch=config.batch_size,
                     effective_batch=config.batch_size * config.grad_accumulation * context.world_size,
+                    optimizer=metadata["optimizer"],
                 )
             ),
             flush=True,
@@ -253,6 +255,16 @@ def _train(
         return out / "last.pt"
     while progress["epoch"] < config.epochs:
         epoch, offset = progress["epoch"], progress["offset"]
+        set_epoch_learning_rates(optimizer, config, epoch)
+        log_record(
+            dict(
+                event="learning_rates",
+                epoch=epoch + 1,
+                lrs=learning_rates(optimizer),
+                lr_scheduler=config.lr_scheduler,
+                min_lr_ratio=config.min_lr_ratio,
+            )
+        )
         sampler = (
             DistributedClipSampler(dataset, epoch, context.rank, context.world_size, offset)
             if context.enabled
@@ -281,8 +293,6 @@ def _train(
             }
             local_size = batch["images"].shape[0]
             boundary = group_size + 1 == config.grad_accumulation or batch_index + 1 == len(loader)
-            for group in optimizer.param_groups:
-                group["lr"] = group["base_lr"] * min(1.0, (epoch + 1) / max(1, config.warmup_epochs))
             amp = (
                 torch.autocast("cuda", dtype=torch.float16)
                 if scaler.is_enabled()
@@ -353,6 +363,7 @@ def _train(
                 seconds=time.monotonic() - started,
                 effect_examples=int(model.association.effect_examples),
                 world_size=context.world_size,
+                lrs=learning_rates(optimizer),
             )
             if hasattr(model, "al"):
                 log.update(

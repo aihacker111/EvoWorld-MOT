@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import yaml
 from evoworld.config import Config, resolve, sha256
 from evoworld.geometry import xyxy_to_cxcywh
+from evoworld.classes import group_nms
 from .reid import StandardJDEReID
 
 
@@ -149,13 +150,11 @@ class FalconPerception(nn.Module):
         for row in decoded:
             corners = (row[:, :4] / scale).clamp(0, 1)
             valid = (corners[:, 2:] > corners[:, :2]).all(-1) & torch.isfinite(row).all(-1)
-            output.append(
-                {
-                    "boxes": xyxy_to_cxcywh(corners[valid]),
-                    "scores": row[valid, 4],
-                    "classes": row[valid, 5].long(),
-                }
-            )
+            boxes, scores, classes = xyxy_to_cxcywh(corners[valid]), row[valid, 4], row[valid, 5].long()
+            # Same contract in training proposals and inference: one box per object even when
+            # the detector fires on two confusable classes.
+            keep = group_nms(boxes, scores, classes, self.config)
+            output.append({"boxes": boxes[keep], "scores": scores[keep], "classes": classes[keep]})
         return output
 
     def train(self, mode=True):
