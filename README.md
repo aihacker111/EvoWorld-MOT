@@ -44,7 +44,13 @@ bash tools/train_2gpu.sh --config configs/full.yaml --out /kaggle/working/runs/a
 # Train đầy đủ (bỏ --init-checkpoint để train mới từ detector Falcon)
 bash tools/train_2gpu.sh --config configs/full.yaml --out /kaggle/working/runs/al_v3 \
   --init-checkpoint /kaggle/working/runs/al_2gpu/last.pt
+
+# Một GPU: batch 2 × accumulation 8 = effective batch 16, bằng run 2 GPU
+bash tools/train_1gpu.sh --out /kaggle/working/runs/al_v3_1gpu \
+  --init-checkpoint /kaggle/working/runs/al_2gpu/last.pt
 ```
+
+`tools/train_1gpu.sh` kiểm tra có CUDA GPU, mặc định `configs/full.yaml` và 8 worker. `EVOWORLD_GPU=1` chọn GPU khác. Mọi flag truyền thêm (`--config`, `--batch-size`, `--grad-accumulation`, `--workers`, `--resume`, `--validate-after-steps`, `--log-every`...) sẽ ghi đè mặc định.
 
 Warm-start từ checkpoint v0.2 vẫn hợp lệ: cột confidence mới của pair MLP được zero-init và `score_weights` lấy đúng giá trị cũ, nên association ban đầu giữ nguyên hành vi. Ngoại lệ là statistics bão hòa, khiến đầu vào của AL đổi thang đo; các head AL sẽ thích nghi khi train lại. Checkpoint cũ vẫn chạy được `track`/`evaluate` qua cùng loader.
 
