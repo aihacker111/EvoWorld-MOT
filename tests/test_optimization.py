@@ -151,13 +151,15 @@ def test_older_config_defaults_are_expanded_before_resume_comparison(config):
         check_resume(checkpoint, replace(config, reid_lr=3e-4), {})
 
 
-def test_fast_profile_only_changes_optimizer_rates_and_output():
+def test_full_profile_uses_module_rates_and_matches_fast_profile():
     root = Path(__file__).resolve().parents[1]
     base = Config.load(root / "configs/full.yaml").dictionary()
     fast = Config.load(root / "configs/full_fast_lr.yaml").dictionary()
-    assert {k for k in base if base[k] != fast[k]} == set(RATES) | {"out"}
+    # Only machine-specific paths and the run directory may differ between the profiles.
+    local = {"detector_checkpoint", "train_annotations", "train_images", "val_annotations", "val_images", "out"}
+    assert {k for k in base if base[k] != fast[k]} <= local
     for key, value in RATES.items():
-        assert fast[key] == value
+        assert base[key] == value and fast[key] == value
 
 
 def test_cosine_matches_pytorch_after_warmup_and_keeps_group_ratios(config):

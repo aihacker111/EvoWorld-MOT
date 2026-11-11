@@ -194,7 +194,7 @@ CPU là mặc định trên Mac; CUDA tự chọn khi có. `--max-steps` là t�
 
 ### Thử learning rate cao hơn cho detector/ReID
 
-`configs/full_fast_lr.yaml` là cấu hình thử riêng, sao chép data/model paths từ `full.yaml`; cấu hình baseline được giữ để đối chiếu. Các LR là giá trị cơ sở của **nhóm tham số**, không phải hệ số của loss:
+Từ v0.3, `configs/full.yaml` dùng luôn bộ LR ở cột **Fast LR** bên dưới. `configs/full_fast_lr.yaml` giữ cùng LR và chỉ khác đường dẫn dữ liệu (Kaggle) và `out`. Cột Baseline là giá trị cũ của bản 0.2, chỉ để đối chiếu; muốn chạy lại thì truyền `--perception-lr 5e-6 --reid-lr 1e-4 --association-lr 1e-4`. Các LR là giá trị cơ sở của **nhóm tham số**, không phải hệ số của loss:
 
 | Nhóm tham số | Baseline | Fast LR | Epoch 1 (warmup /3) |
 |---|---:|---:|---:|

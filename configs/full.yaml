@@ -1,6 +1,6 @@
 # Joint perception, world model and per-track life policies.
 detector_yaml: configs/falcon_detector.yaml
-detector_checkpoint: /kaggle/input/datasets/huynhlong111/falcon-detector-ckpt/falcon_detector.pth
+detector_checkpoint: /media/hung/HDD2/workplaces/tin/EvoWorld-MOT/falcon_detector.pth
 detector_scale: s
 num_classes: 10
 category_ids:
@@ -44,7 +44,12 @@ workers: 2
 epochs: 40
 grad_accumulation: 4
 learning_rate: 0.0001
-perception_lr: 5.0e-06
+perception_lr: 5.0e-05
+reid_lr: 0.0003
+association_lr: 0.0002
+world_lr: 0.0001
+camera_lr: 0.0001
+al_lr: 0.0001
 weight_decay: 0.0001
 grad_clip: 5.0
 warmup_epochs: 3
