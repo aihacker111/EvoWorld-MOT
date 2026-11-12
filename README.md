@@ -401,6 +401,8 @@ python -m evoworld evaluate --checkpoint runs/al_full/best.pt \
   --device cuda:0 --out runs/eval_al
 ```
 
+`evaluate` hiện progress bar trên stderr; stdout chỉ còn JSON kết quả. Thêm `--save-images` để lưu ảnh kết quả vào `<out>/images/<sequence>/<frame>.jpg`: GT trắng mảnh, track tô màu theo ID kèm `ID cCategory score`, vùng ignore và track bị loại vì nằm trong vùng ignore màu xám. `--save-every N` chỉ lưu mỗi N frame của từng sequence để tiết kiệm đĩa.
+
 Source nhận video hoặc thư mục ảnh. Output: `preview.mp4` (fallback AVI), MOT `tracks.txt`, `classes.jsonl`, `summary.json` và **`life.jsonl`**. Life log ghi ID/phase/existence/uncertainty/credit, số ROI recheck, forecast agent-steps, ID phục hồi và ID kết thúc theo frame.
 
 Evaluator class-aware IoU0.5, global IDF1, MOTA, ID switches, precision/recall. Optional HOTA dùng TrackEval1.3.0:

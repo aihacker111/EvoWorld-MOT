@@ -61,6 +61,12 @@ def main():
             command.add_argument("--annotations", required=True)
             command.add_argument("--images", required=True)
             command.add_argument("--hota", action="store_true")
+            command.add_argument(
+                "--save-images", action="store_true", help="Write rendered frames to <out>/images/<sequence>/"
+            )
+            command.add_argument(
+                "--save-every", type=int, default=1, help="Render every N-th frame per sequence"
+            )
     args = parser.parse_args()
     if args.command == "synthetic":
         from evoworld.synthetic import make_dataset
@@ -164,9 +170,31 @@ def main():
 
             result = track(model, args.source, resolve(args.out), args.device, args.fps)
         else:
+            from tqdm import tqdm
             from evoworld.evaluate import evaluate
 
-            result = evaluate(model, args.annotations, args.images, resolve(args.out), args.device, args.hota)
+            # Progress goes to stderr so stdout stays a clean JSON result.
+            bar = tqdm(unit="frame", dynamic_ncols=True, smoothing=0.1)
+
+            def progress(record):
+                bar.total = record["total_frames"]
+                bar.set_postfix_str(record["sequence"], refresh=False)
+                bar.update(record["frames"] - bar.n)
+
+            try:
+                result = evaluate(
+                    model,
+                    args.annotations,
+                    args.images,
+                    resolve(args.out),
+                    args.device,
+                    args.hota,
+                    progress=progress,
+                    save_images=args.save_images,
+                    save_every=args.save_every,
+                )
+            finally:
+                bar.close()
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import defaultdict
 import json
 from pathlib import Path
+import cv2
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
@@ -11,6 +12,7 @@ from evoworld.camera import estimate_affine
 from evoworld.config import resolve, atomic_json
 from evoworld.data import CocoVideo, prepare_image
 from evoworld.geometry import pair_iou, cxcywh_to_xyxy
+from evoworld.inference import draw_track
 from evoworld.tracking import EcologyTracker
 
 
@@ -116,6 +118,31 @@ def ignore_unmatched(pred_boxes, gt_boxes, gt_classes, pred_classes, ignored, fr
     return keep
 
 
+def render_frame(image, frame, gt_boxes, rows, keep, ignored, category_ids, sequence):
+    """GT in thin white, ignore regions in gray, predictions colored by ID (gray when ignored)."""
+    width, height = frame["width"], frame["height"]
+    for annotation in ignored:
+        x, y, w, h = annotation["bbox"]
+        cv2.rectangle(image, (int(x), int(y)), (int(x + w), int(y + h)), (110, 110, 110), 1)
+    for cx, cy, w, h in gt_boxes.cpu().tolist():
+        x0, y0 = (cx - w / 2) * width, (cy - h / 2) * height
+        cv2.rectangle(
+            image, (int(x0), int(y0)), (int(x0 + w * width), int(y0 + h * height)), (255, 255, 255), 1
+        )
+    for (identity, _, box, confidence, cls), counted in zip(rows, keep.tolist()):
+        cx, cy, w, h = box.cpu().tolist()
+        x, y, w, h = (cx - w / 2) * width, (cy - h / 2) * height, w * width, h * height
+        if counted:
+            draw_track(image, identity, x, y, w, h, category_ids[cls], confidence)
+        else:
+            cv2.rectangle(image, (int(x), int(y)), (int(x + w), int(y + h)), (110, 110, 110), 1)
+    label = f"{sequence}  frame {frame['frame_id']}  tracks {int(keep.sum())}  gt {len(gt_boxes)}"
+    (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+    cv2.rectangle(image, (0, 0), (text_w + 12, text_h + 12), (0, 0, 0), -1)
+    cv2.putText(image, label, (6, text_h + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    return image
+
+
 def backfill_delay(config):
     """Frames a tentative row can arrive late (0 when backfill is off)."""
     if config.tracker_mode != "al" or not config.backfill_tentative:
@@ -124,9 +151,24 @@ def backfill_delay(config):
 
 
 @torch.no_grad()
-def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_frames=None, progress=None):
+def evaluate(
+    model,
+    annotations,
+    images,
+    out,
+    device="cpu",
+    hota=False,
+    *,
+    max_frames=None,
+    progress=None,
+    save_images=False,
+    save_every=1,
+):
+    """save_images writes <out>/images/<sequence>/<frame>.jpg for every save_every-th frame."""
     if max_frames is not None and max_frames < 1:
         raise ValueError("max_frames must be positive")
+    if save_every < 1:
+        raise ValueError("save_every must be positive")
     if model.config.backend != "falcon":
         raise ValueError("Benchmark evaluation requires the real Falcon detector")
     out = Path(out)
@@ -151,6 +193,11 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_f
             break
         frames = frames[: total_frames - processed]
         report(seq)
+        # No path traversal through user-provided sequence names.
+        safe_seq = seq.replace("/", "_").replace("\\", "_").replace("..", "_")
+        image_dir = out / "images" / safe_seq
+        if save_images:
+            image_dir.mkdir(parents=True, exist_ok=True)
         tracker = EcologyTracker(model)
         metrics = IdentityMetrics()
         previous, previous_boxes = None, np.empty((0, 4), np.float32)
@@ -160,7 +207,7 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_f
         buffer = {}
 
         def flush(frame_record):
-            frame, gt_ids, gt_classes, gt_boxes, rows = frame_record
+            frame, gt_ids, gt_classes, gt_boxes, rows, image = frame_record
             pred_boxes = torch.stack([r[2] for r in rows]) if rows else gt_boxes.new_empty(0, 4)
             pred_classes = torch.tensor([r[4] for r in rows], device=gt_boxes.device, dtype=torch.long)
             keep = ignore_unmatched(
@@ -171,10 +218,19 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_f
                 ignored[frame["id"]],
                 frame,
             )
+            if image is not None:
+                render_frame(
+                    image, frame, gt_boxes, rows, keep, ignored[frame["id"]], model.config.category_ids, seq
+                )
+                cv2.imwrite(
+                    str(image_dir / f"{frame['frame_id']:07d}.jpg"), image, [cv2.IMWRITE_JPEG_QUALITY, 90]
+                )
             selected = [r for r, ok in zip(rows, keep) if ok]
             pred_boxes, pred_classes = pred_boxes[keep], pred_classes[keep]
             pred_ids = [r[0] for r in selected]
-            similarity = metrics.update(gt_ids, gt_boxes, gt_classes, pred_ids, pred_boxes, pred_classes.tolist())
+            similarity = metrics.update(
+                gt_ids, gt_boxes, gt_classes, pred_ids, pred_boxes, pred_classes.tolist()
+            )
             sequence_data.append((gt_ids, pred_ids, similarity))
             for identity, _, box, confidence, cls in rows:
                 x, y, w, h = box.cpu().tolist()
@@ -191,7 +247,7 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_f
                     dict(frame=frame["frame_id"], id=identity, category_id=model.config.category_ids[cls])
                 )
 
-        for frame in frames:
+        for index, frame in enumerate(frames):
             image, annotations_frame = video.read(frame)
             tensor, resized = prepare_image(image, model.config)
             tensor = tensor[None].to(device)
@@ -206,7 +262,8 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_f
             gt = video.boxes(frame, annotations_frame)
             gt_ids, gt_classes = [r[0] for r in gt], [r[1] for r in gt]
             gt_boxes = tensor.new_tensor(np.array([r[2] for r in gt], np.float32).reshape(-1, 4))
-            buffer[frame["frame_id"]] = (frame, gt_ids, gt_classes, gt_boxes, list(rows))
+            canvas = image if save_images and index % save_every == 0 else None
+            buffer[frame["frame_id"]] = (frame, gt_ids, gt_classes, gt_boxes, list(rows), canvas)
             for frame_id, identity, box, confidence, cls in getattr(tracker, "last_backfill", []):
                 if frame_id in buffer:
                     buffer[frame_id][4].append((identity, -1, box, confidence, cls))
@@ -219,8 +276,6 @@ def evaluate(model, annotations, images, out, device="cpu", hota=False, *, max_f
                 report(seq)
         for frame_id in sorted(buffer):
             flush(buffer.pop(frame_id))
-        # No path traversal through user-provided sequence names.
-        safe_seq = seq.replace("/", "_").replace("\\", "_").replace("..", "_")
         (out / f"{safe_seq}.txt").write_text("".join(lines))
         (out / f"{safe_seq}.classes.json").write_text(json.dumps(sidecar))
         result = metrics.counts()
